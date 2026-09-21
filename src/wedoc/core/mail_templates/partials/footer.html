@@ -1,0 +1,9 @@
+<!-- Footer -->
+<tr>
+    <td style="background-color: #f3f3f3; padding: 15px; text-align: center; color: #555;">
+        <p style="margin: 0;">&copy;{{ current_year }} {{ brand_name | e }}</p>
+        {% if not hide_help_center %}
+        <a href="{{ public_origin | e }}" style="color: #3276dc;">Help Center</a>
+        {% endif %}
+    </td>
+</tr>

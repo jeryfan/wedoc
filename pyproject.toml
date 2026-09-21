@@ -1,0 +1,59 @@
+[project]
+name = "wedoc"
+version = "0.1.0"
+description = "wedoc backend: self-hosted collaborative spreadsheet-database platform"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "email-validator>=2.2",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "redis>=5.2",
+    "pyjwt>=2.10",
+    "bcrypt>=4.2",
+    "cryptography>=43",
+    "httpx>=0.28",
+    "structlog>=24.4",
+    "jinja2>=3.1",
+    "aiosmtplib>=4.0",
+    "pillow>=11.0",
+    "openpyxl>=3.1.5",
+    "chardet>=5.2",
+    "pypdf>=5.1",
+    "boto3>=1.35",
+    "arq>=0.26",
+    "python-multipart>=0.0.32",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "sqlacodegen>=3.0",
+    "pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+wedoc = "wedoc.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wedoc"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
