@@ -524,9 +524,17 @@ class PermissionService:
                 await session.execute(select(_space).where(_space.c.id == space_id))
             ).mappings().first()
         if not space:
-            raise ApiError(f"space {space_id} is not found", HttpErrorCode.RESTRICTED_RESOURCE)
+            raise ApiError(
+                f"space {space_id} is not found",
+                HttpErrorCode.RESTRICTED_RESOURCE,
+                {"localization": {"i18nKey": "httpErrors.space.notFound"}},
+            )
         if space["deleted_time"] and not include_inactive_resource:
-            raise ApiError(f"space {space_id} is deleted", HttpErrorCode.RESTRICTED_RESOURCE)
+            raise ApiError(
+                f"space {space_id} is deleted",
+                HttpErrorCode.RESTRICTED_RESOURCE,
+                {"localization": {"i18nKey": "httpErrors.space.deleted"}},
+            )
         if not collaborators:
             return None
         return get_max_level_role(collaborators)
