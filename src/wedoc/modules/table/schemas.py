@@ -28,6 +28,7 @@ FieldTypeStr = ZodEnumStr(
 )
 ViewTypeStr = ZodEnumStr(["grid", "kanban", "form", "calendar", "gallery"])
 FieldKeyTypeStr = ZodEnumStr(["name", "id"])
+PositionStr = ZodEnumStr(["before", "after"])
 
 PRIMARY_SUPPORTED_TYPES = {
     "singleLineText",
@@ -106,3 +107,34 @@ class CreateTableBody(ZodModel):
         if len(trimmed) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
         return trimmed
+
+
+class TableNameBody(ZodModel):
+    name: str
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _name(cls, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        trimmed = v.strip()
+        if len(trimmed) < 1:
+            raise ValueError("Too small: expected string to have >=1 characters")
+        return trimmed
+
+
+class TableIconBody(ZodModel):
+    icon: ZodNullableStr = None
+
+
+class TableDescriptionBody(ZodModel):
+    description: ZodNullableStr = None
+
+
+class DbTableNameBody(ZodModel):
+    dbTableName: str
+
+
+class UpdateOrderBody(ZodModel):
+    anchorId: str
+    position: PositionStr

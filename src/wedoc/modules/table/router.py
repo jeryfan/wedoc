@@ -6,12 +6,19 @@ and socket doc-ids/snapshot-bulk are deferred (see docs/api-parity-ledger.md).
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 
 from ...core.security.auth import auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
-from .schemas import CreateTableBody
+from .schemas import (
+    CreateTableBody,
+    DbTableNameBody,
+    TableDescriptionBody,
+    TableIconBody,
+    TableNameBody,
+    UpdateOrderBody,
+)
 from .service import TableService
 
 router = APIRouter(
@@ -31,6 +38,60 @@ async def create_table(baseId: str, request: Request) -> dict[str, Any]:
 @permissions("table|read")
 async def list_tables(baseId: str) -> list[dict[str, Any]]:
     return await TableService().list_tables(baseId)
+
+
+@router.put("/{tableId}/name", status_code=200)
+@permissions("table|update")
+async def update_name(baseId: str, tableId: str, request: Request) -> Response:
+    body = TableNameBody.zod_validate(await read_json_body(request))
+    await TableService().update_name(baseId, tableId, body.name)
+    return Response(status_code=200)
+
+
+@router.put("/{tableId}/icon", status_code=200)
+@permissions("table|update")
+async def update_icon(baseId: str, tableId: str, request: Request) -> Response:
+    body = TableIconBody.zod_validate(await read_json_body(request))
+    await TableService().update_icon(baseId, tableId, body.icon)
+    return Response(status_code=200)
+
+
+@router.put("/{tableId}/description", status_code=200)
+@permissions("table|update")
+async def update_description(baseId: str, tableId: str, request: Request) -> Response:
+    body = TableDescriptionBody.zod_validate(await read_json_body(request))
+    await TableService().update_description(baseId, tableId, body.description)
+    return Response(status_code=200)
+
+
+@router.put("/{tableId}/db-table-name", status_code=200)
+@permissions("table|update")
+async def update_db_table_name(baseId: str, tableId: str, request: Request) -> Response:
+    body = DbTableNameBody.zod_validate(await read_json_body(request))
+    await TableService().update_db_table_name(baseId, tableId, body.dbTableName)
+    return Response(status_code=200)
+
+
+@router.put("/{tableId}/order", status_code=200)
+@permissions("table|update")
+async def update_order(baseId: str, tableId: str, request: Request) -> Response:
+    body = UpdateOrderBody.zod_validate(await read_json_body(request))
+    await TableService().update_order(baseId, tableId, body.anchorId, body.position)
+    return Response(status_code=200)
+
+
+@router.delete("/{tableId}", status_code=200)
+@permissions("table|delete")
+async def delete_table(baseId: str, tableId: str) -> Response:
+    await TableService().delete_table(baseId, tableId)
+    return Response(status_code=200)
+
+
+@router.delete("/{tableId}/permanent", status_code=200)
+@permissions("table|delete")
+async def permanent_delete_table(baseId: str, tableId: str) -> Response:
+    await TableService().permanent_delete_table(baseId, tableId)
+    return Response(status_code=200)
 
 
 @router.get("/{tableId}", status_code=200)

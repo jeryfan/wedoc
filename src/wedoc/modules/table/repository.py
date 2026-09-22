@@ -6,7 +6,7 @@ live here until the field and view modules absorb them.
 
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 
 from ...db import engine as db_engine
 from ...db.models_meta import Field, TableMeta, View
@@ -34,22 +34,52 @@ async def insert_table_meta(fields: dict[str, Any]) -> dict[str, Any]:
         return dict(row)
 
 
-async def get_table_meta_row(table_id: str, base_id: str) -> dict[str, Any] | None:
+async def get_table_meta_row(
+    table_id: str, base_id: str, include_deleted: bool = False
+) -> dict[str, Any] | None:
     async with db_engine.session() as session:
-        row = (
-            (
-                await session.execute(
-                    select(TableMeta).where(
-                        TableMeta.id == table_id,
-                        TableMeta.base_id == base_id,
-                        TableMeta.deleted_time.is_(None),
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
+        stmt = select(TableMeta).where(TableMeta.id == table_id, TableMeta.base_id == base_id)
+        if not include_deleted:
+            stmt = stmt.where(TableMeta.deleted_time.is_(None))
+        row = (await session.execute(stmt)).scalars().first()
     return _row(row) if row else None
+
+
+async def list_next_table_by_order(
+    base_id: str, anchor_order: float, *, below: bool
+) -> dict[str, Any] | None:
+    """Neighbor of the anchor inside one base, for the order recomputation."""
+    async with db_engine.session() as session:
+        stmt = select(TableMeta.id, TableMeta.order).where(
+            TableMeta.base_id == base_id,
+            TableMeta.deleted_time.is_(None),
+            TableMeta.provision_state == "ready",
+            TableMeta.order < anchor_order if below else TableMeta.order > anchor_order,
+        )
+        stmt = stmt.order_by(TableMeta.order.desc() if below else TableMeta.order.asc())
+        row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    return {"id": row[0], "order": row[1]}
+
+
+async def soft_delete_table_row(table_id: str, when: Any, version: int) -> None:
+    async with db_engine.session() as session:
+        await session.execute(
+            update(TableMeta)
+            .where(TableMeta.id == table_id)
+            .values(deleted_time=when, version=version, provision_state="deleting")
+        )
+        await session.commit()
+
+
+async def delete_table_cascade_rows(table_id: str) -> None:
+    """Permanent delete: meta row, field/view rows and the physical table."""
+    async with db_engine.session() as session:
+        await session.execute(delete(Field).where(Field.table_id == table_id))
+        await session.execute(delete(View).where(View.table_id == table_id))
+        await session.execute(delete(TableMeta).where(TableMeta.id == table_id))
+        await session.commit()
 
 
 async def list_table_meta_rows(base_id: str) -> list[dict[str, Any]]:

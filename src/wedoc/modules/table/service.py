@@ -111,6 +111,14 @@ def _unsupported_field_type(field_type: str) -> ApiError:
     )
 
 
+def _table_not_found(table_id: str, base_id: str) -> ApiError:
+    return ApiError(
+        f"Table {table_id} not found in base {base_id}",
+        HttpErrorCode.NOT_FOUND,
+        {"localization": {"i18nKey": "httpErrors.notFound"}},
+    )
+
+
 def _normalize_options(field_type: str, options: dict[str, Any] | None) -> dict[str, Any]:
     options = dict(options) if options else {}
     if field_type == "number" and "formatting" not in options:
@@ -362,7 +370,7 @@ class TableService:
     @staticmethod
     def _table_vo(table_row: dict[str, Any], default_view_id: str | None) -> dict[str, Any]:
         order = table_row["order"]
-        return {
+        vo: dict[str, Any] = {
             "id": table_row["id"],
             "name": table_row["name"],
             "dbTableName": table_row["db_table_name"],
@@ -371,14 +379,21 @@ class TableService:
             "order": int(order) if float(order).is_integer() else order,
             "lastModifiedTime": _iso(table_row["last_modified_time"] or table_row["created_time"]),
         }
+        if table_row.get("description") is not None:
+            vo["description"] = table_row["description"]
+        if table_row.get("icon") is not None:
+            vo["icon"] = table_row["icon"]
+        return vo
 
     async def get_table(self, base_id: str, table_id: str) -> dict[str, Any]:
-        table_row = await repository.get_table_meta_row(table_id, base_id)
+        table_row = await repository.get_table_meta_row(table_id, base_id, include_deleted=True)
         if table_row is None:
+            raise _table_not_found(table_id, base_id)
+        if table_row["deleted_time"] is not None:
             raise ApiError(
-                f"Table {table_id} not found in base {base_id}",
+                "Table not found",
                 HttpErrorCode.NOT_FOUND,
-                {"localization": {"i18nKey": "httpErrors.notFound"}},
+                {"domainCode": "table.not_found", "domainTags": ["not-found"]},
             )
         default_view_ids = await repository.get_default_view_ids([table_id])
         if table_id not in default_view_ids:
@@ -388,6 +403,146 @@ class TableService:
                 {"localization": {"i18nKey": "httpErrors.view.defaultViewNotFound"}},
             )
         return self._table_vo(table_row, default_view_ids[table_id])
+
+    async def update_name(self, base_id: str, table_id: str, name: str) -> None:
+        table = await repository.get_table_meta_row(table_id, base_id)
+        if table is None:
+            raise _table_not_found(table_id, base_id)
+        await repository.update_table_meta_row(
+            table_id,
+            {
+                "name": name,
+                "version": table["version"] + 1,
+                "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
+                "last_modified_by": cls.get("user.id"),
+            },
+        )
+
+    async def update_icon(self, base_id: str, table_id: str, icon: str | None) -> None:
+        table = await repository.get_table_meta_row(table_id, base_id)
+        if table is None:
+            raise _table_not_found(table_id, base_id)
+        await repository.update_table_meta_row(
+            table_id,
+            {
+                "icon": icon,
+                "version": table["version"] + 1,
+                "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
+                "last_modified_by": cls.get("user.id"),
+            },
+        )
+
+    async def update_description(
+        self, base_id: str, table_id: str, description: str | None
+    ) -> None:
+        table = await repository.get_table_meta_row(table_id, base_id)
+        if table is None:
+            raise _table_not_found(table_id, base_id)
+        await repository.update_table_meta_row(
+            table_id,
+            {
+                "description": description,
+                "version": table["version"] + 1,
+                "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
+                "last_modified_by": cls.get("user.id"),
+            },
+        )
+
+    async def update_db_table_name(self, base_id: str, table_id: str, name: str) -> None:
+        # v1 route wording/errors (no v2 counterpart).
+        candidate = f"{base_id}.{ddl.convert_name_to_valid_character(name, 63)}"
+        exist = await repository.find_table_by_db_table_name(candidate, base_id)
+        if exist and exist["id"] != table_id:
+            raise ApiError(
+                f"dbTableName {name} already exists",
+                HttpErrorCode.VALIDATION_ERROR,
+                {"localization": {"i18nKey": "httpErrors.table.dbTableNameAlreadyExists"}},
+            )
+        table = await repository.get_table_meta_row(table_id, base_id)
+        if table is None:
+            raise ApiError(
+                f"table {table_id} not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.table.notFound"}},
+            )
+        old = table["db_table_name"]
+        old_table_name = old.split(".", 1)[1] if "." in old else old
+        new_table_name = candidate.split(".", 1)[1]
+        await repository.execute_data_ddl(
+            [ddl.rename_data_table_sql(base_id, old_table_name, new_table_name)]
+        )
+        await repository.update_table_meta_row(
+            table_id,
+            {
+                "db_table_name": candidate,
+                "version": table["version"] + 1,
+                "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
+                "last_modified_by": cls.get("user.id"),
+            },
+        )
+
+    async def update_order(
+        self, base_id: str, table_id: str, anchor_id: str, position: str
+    ) -> None:
+        table = await repository.get_table_meta_row(table_id, base_id)
+        if table is None:
+            raise _table_not_found(table_id, base_id)
+        anchor = await repository.get_table_meta_row(anchor_id, base_id)
+        if anchor is None:
+            raise ApiError(
+                f"Anchor {anchor_id} not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.table.anchorNotFound"}},
+            )
+        new_order = await self._compute_order(base_id, anchor, position)
+        await repository.update_table_meta_row(
+            table_id,
+            {
+                "order": new_order,
+                "version": table["version"] + 1,
+                "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
+                "last_modified_by": cls.get("user.id"),
+            },
+        )
+
+    async def _compute_order(
+        self, base_id: str, anchor: dict[str, Any], position: str
+    ) -> float:
+        below = position == "after"
+        neighbor = await repository.list_next_table_by_order(
+            base_id, anchor["order"], below=position == "before"
+        )
+        if neighbor is None:
+            return anchor["order"] + (1 if below else -1)
+        order = (neighbor["order"] + anchor["order"]) / 2
+        if abs(order - anchor["order"]) < 2 * 2.220446049250313e-16:
+            # gap exhausted: re-shuffle the base to integral orders, recompute.
+            await self._shuffle_orders(base_id)
+            anchor = await repository.get_table_meta_row(anchor["id"], base_id)  # type: ignore[assignment]
+            assert anchor is not None
+            return await self._compute_order(base_id, anchor, position)
+        return order
+
+    async def _shuffle_orders(self, base_id: str) -> None:
+        for index, table in enumerate(await repository.list_table_meta_rows(base_id), start=1):
+            await repository.update_table_meta_row(table["id"], {"order": float(index)})
+
+    async def delete_table(self, base_id: str, table_id: str) -> None:
+        table = await repository.get_table_meta_row(table_id, base_id)
+        if table is None:
+            raise _table_not_found(table_id, base_id)
+        await repository.soft_delete_table_row(
+            table_id, datetime.now(UTC).replace(tzinfo=None), table["version"] + 1
+        )
+
+    async def permanent_delete_table(self, base_id: str, table_id: str) -> None:
+        table = await repository.get_table_meta_row(table_id, base_id, include_deleted=True)
+        if table is None:
+            raise _table_not_found(table_id, base_id)
+        db_table_name = table["db_table_name"]
+        table_name = db_table_name.split(".", 1)[1] if "." in db_table_name else db_table_name
+        await repository.execute_data_ddl([ddl.drop_data_table_sql(base_id, table_name)])
+        await repository.delete_table_cascade_rows(table_id)
 
     async def list_tables(self, base_id: str) -> list[dict[str, Any]]:
         rows = await repository.list_table_meta_rows(base_id)

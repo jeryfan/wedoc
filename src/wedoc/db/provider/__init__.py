@@ -78,6 +78,13 @@ def drop_data_table_sql(schema_name: str, table_name: str) -> str:
     return f"DROP TABLE IF EXISTS {_qualified(schema_name, table_name)}"
 
 
+def rename_data_table_sql(schema_name: str, old_name: str, new_name: str) -> str:
+    return (
+        f"ALTER TABLE {_qualified(schema_name, old_name)} "
+        f"RENAME TO {_quoted_identifier(new_name)}"
+    )
+
+
 # field type -> physical column type; extended with the field module later.
 FIELD_DB_TYPES: dict[str, str] = {
     "singleLineText": "text",
