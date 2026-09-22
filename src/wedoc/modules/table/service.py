@@ -366,8 +366,11 @@ class TableService:
                     value = record_fields.get(field["name"])
                     if value is None:
                         value = record_fields.get(field["id"])
-                values.append(value)
-                vo_fields[field["name"]] = value
+                db_value = _to_db_value(field, value) if value is not None else None
+                values.append(db_value)
+                vo_fields[field["name"]] = (
+                    db_value if field["type"] == "checkbox" else value
+                )
                 # initial values are logged as cell history (null -> value) by the
                 # table-create path; records created via the record open API are not.
                 entry = build_history_row(
@@ -735,3 +738,14 @@ class TableService:
         rows = await repository.list_table_meta_rows(base_id)
         default_view_ids = await repository.get_default_view_ids([r["id"] for r in rows])
         return [self._table_vo(r, default_view_ids.get(r["id"])) for r in rows]
+
+
+def _to_db_value(field: dict[str, Any], value: Any) -> Any:
+    # the reference persists unchecked checkbox cells as NULL.
+    if CELL_VALUE_TYPES[field["type"]] == "boolean" and value is False:
+        return None
+    # API date cells arrive as ISO strings; the driver wants datetimes.
+    if CELL_VALUE_TYPES[field["type"]] == "dateTime" and isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return value

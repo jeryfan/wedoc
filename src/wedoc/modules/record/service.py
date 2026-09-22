@@ -177,10 +177,17 @@ class RecordService:
     def _to_db_value(field: dict[str, Any], value: Any) -> Any:
         if value is None:
             return None
+        # the reference persists unchecked checkbox cells as NULL.
+        if field["cell_value_type"] == "boolean" and value is False:
+            return None
         if field["type"] in JSONB_FIELD_TYPES:
             return json.dumps(value, separators=(",", ":"))
         if field["type"] in ARRAY_FIELD_TYPES:
             return list(value) if isinstance(value, (list, tuple)) else [value]
+        if field["cell_value_type"] == "dateTime" and isinstance(value, str):
+            # API date cells arrive as ISO strings; the driver wants datetimes.
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
         return value
 
     @staticmethod
@@ -315,7 +322,10 @@ class RecordService:
             if field is None:
                 continue
             direction = "DESC" if item.get("order") == "desc" else "ASC"
-            terms.append(f'"{field["db_field_name"]}" {direction}')
+            # the reference sort function pins NULLS FIRST on asc / NULLS LAST
+            # on desc (opposite of the PG default).
+            nulls = "NULLS LAST" if direction == "DESC" else "NULLS FIRST"
+            terms.append(f'"{field["db_field_name"]}" {direction} {nulls}')
         return " ORDER BY " + ", ".join(terms) if terms else ""
 
     # ---- endpoints ---------------------------------------------------------
@@ -480,8 +490,9 @@ class RecordService:
             submitted: dict[str, Any] = {}
             for key, value in item.fields.items():
                 field = self._field_by_key(fields, key, body.fieldKeyType)
-                values[field["db_field_name"]] = self._to_db_value(field, value)
-                submitted[key] = value
+                db_value = self._to_db_value(field, value)
+                values[field["db_field_name"]] = db_value
+                submitted[key] = db_value if field["cell_value_type"] == "boolean" else value
             await repository.insert_row(table["base_id"], table_id, values)
             records_vo.append({"id": record_id, "fields": submitted})
         return {"records": records_vo}

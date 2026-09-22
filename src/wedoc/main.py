@@ -152,6 +152,9 @@ def create_app() -> FastAPI:
     app.include_router(field_router)
     app.include_router(view_router)
     app.include_router(record_router)
+    from .modules.aggregation.router import router as aggregation_router
+
+    app.include_router(aggregation_router)
     social = social_router(settings)
     if social.routes:
         app.include_router(social)
