@@ -138,3 +138,8 @@ class DbTableNameBody(ZodModel):
 class UpdateOrderBody(ZodModel):
     anchorId: str
     position: PositionStr
+
+
+class DuplicateTableBody(ZodModel):
+    name: str
+    includeRecords: bool

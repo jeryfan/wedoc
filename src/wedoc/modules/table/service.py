@@ -89,6 +89,34 @@ RESERVED_DB_FIELD_NAMES = {
     "__version",
 }
 
+# resources exposed by GET /:tableId/permission (ref tablePermissionVo).
+_TABLE_PERMISSION_RESOURCES = {
+    "table": [
+        "table|create",
+        "table|delete",
+        "table|read",
+        "table|update",
+        "table|import",
+        "table|export",
+        "table|trash_read",
+        "table|trash_update",
+        "table|trash_reset",
+        "table|archive_read",
+        "table|archive_manage",
+    ],
+    "field": ["field|create", "field|delete", "field|read", "field|update"],
+    "record": [
+        "record|create",
+        "record|delete",
+        "record|read",
+        "record|update",
+        "record|comment",
+        "record|copy",
+        "record|archive",
+    ],
+    "view": ["view|create", "view|delete", "view|read", "view|update", "view|share"],
+}
+
 
 def _iso(value: datetime | None) -> str | None:
     if value is None:
@@ -543,6 +571,142 @@ class TableService:
         table_name = db_table_name.split(".", 1)[1] if "." in db_table_name else db_table_name
         await repository.execute_data_ddl([ddl.drop_data_table_sql(base_id, table_name)])
         await repository.delete_table_cascade_rows(table_id)
+
+    async def duplicate_table(
+        self, base_id: str, table_id: str, name: str, include_records: bool
+    ) -> dict[str, Any]:
+        source = await repository.get_table_meta_row(table_id, base_id)
+        if source is None:
+            raise _table_not_found(table_id, base_id)
+        user_id = cls.get("user.id")
+        now = datetime.now(UTC).replace(tzinfo=None)
+
+        source_fields = await repository.list_field_rows(table_id)
+        source_views = await repository.list_view_rows(table_id)
+
+        rows = await repository.list_table_names_and_orders(base_id)
+        new_table_id = new_id(IdPrefix.TABLE)
+        new_db_table_name = f"{base_id}.{new_table_id}"
+        await repository.insert_table_meta(
+            {
+                "id": new_table_id,
+                "base_id": base_id,
+                "name": name,
+                "db_table_name": new_db_table_name,
+                "version": 1,
+                "order": max((float(r["order"]) for r in rows), default=0.0) + 1,
+                "created_by": user_id,
+                "last_modified_by": user_id,
+                "last_modified_time": now,
+            }
+        )
+
+        field_map = {f["id"]: new_id(IdPrefix.FIELD) for f in source_fields}
+        await repository.execute_data_ddl(ddl.create_data_table_sql(base_id, new_table_id))
+        for field in source_fields:
+            await repository.execute_data_ddl(
+                [
+                    ddl.add_field_column_sql(
+                        base_id, new_table_id, field["db_field_name"], field["type"]
+                    )
+                ]
+            )
+        await repository.insert_field_rows(
+            [
+                {
+                    "id": field_map[f["id"]],
+                    "name": f["name"],
+                    "type": f["type"],
+                    "db_field_name": f["db_field_name"],
+                    "db_field_type": f["db_field_type"],
+                    "cell_value_type": f["cell_value_type"],
+                    "is_multiple_cell_value": f["is_multiple_cell_value"],
+                    "is_primary": f["is_primary"],
+                    "not_null": f["not_null"],
+                    "unique": f["unique"],
+                    "is_computed": f["is_computed"],
+                    "options": f["options"],
+                    "table_id": new_table_id,
+                    "order": f["order"],
+                    "version": 1,
+                    "created_by": user_id,
+                    "last_modified_time": now,
+                    "last_modified_by": user_id,
+                }
+                for f in source_fields
+            ]
+        )
+
+        view_map = {v["id"]: new_id(IdPrefix.VIEW) for v in source_views}
+        new_views = []
+        for source_view in source_views:
+            column_meta = {
+                field_map.get(key, key): value
+                for key, value in json.loads(source_view["column_meta"] or "{}").items()
+            }
+            new_views.append(
+                await repository.insert_view_row(
+                    {
+                        "id": view_map[source_view["id"]],
+                        "name": source_view["name"],
+                        "table_id": new_table_id,
+                        "type": source_view["type"],
+                        "order": source_view["order"],
+                        "version": 1,
+                        "column_meta": json.dumps(column_meta, separators=(",", ":")),
+                        "created_by": user_id,
+                        "last_modified_time": now,
+                        "last_modified_by": user_id,
+                    }
+                )
+            )
+
+        if include_records:
+            columns = [
+                "__id",
+                "__created_time",
+                "__last_modified_time",
+                "__created_by",
+                "__last_modified_by",
+                "__version",
+            ] + [f["db_field_name"] for f in source_fields]
+            await repository.copy_data_rows(base_id, new_table_id, table_id, columns)
+
+        prepared = [
+            {
+                "id": field_map[f["id"]],
+                "name": f["name"],
+                "type": f["type"],
+                "dbFieldName": f["db_field_name"],
+                "isPrimary": f["is_primary"],
+                "notNull": f["not_null"],
+                "unique": f["unique"] or False,
+                "options": json.loads(f["options"] or "{}"),
+            }
+            for f in source_fields
+        ]
+        return {
+            "id": new_table_id,
+            "name": name,
+            "dbTableName": new_db_table_name,
+            "defaultViewId": new_views[0]["id"] if new_views else None,
+            "fields": [self._field_vo(f) for f in prepared],
+            "views": [self._view_vo(v) for v in new_views],
+            "fieldMap": field_map,
+            "viewMap": view_map,
+        }
+
+    async def get_permission(self) -> dict[str, dict[str, bool]]:
+        granted = cls.get("permissions") or []
+        result: dict[str, dict[str, bool]] = {res: {} for res in _TABLE_PERMISSION_RESOURCES}
+        for action in granted:
+            resource, _, op = action.partition("|")
+            if op and resource in result:
+                result[resource][action] = True
+        for resource, actions in _TABLE_PERMISSION_RESOURCES.items():
+            for action in actions:
+                result[resource][action] = result[resource].get(action, False)
+        return result
 
     async def list_tables(self, base_id: str) -> list[dict[str, Any]]:
         rows = await repository.list_table_meta_rows(base_id)

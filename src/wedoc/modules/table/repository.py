@@ -213,6 +213,36 @@ async def insert_view_row(fields: dict[str, Any]) -> dict[str, Any]:
         return dict(row)
 
 
+async def list_view_rows(table_id: str) -> list[dict[str, Any]]:
+    async with db_engine.session() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(View)
+                    .where(View.table_id == table_id, View.deleted_time.is_(None))
+                    .order_by(View.order.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return [_row(r) for r in rows]
+
+
+async def copy_data_rows(
+    base_id: str, new_table_id: str, old_table_id: str, columns: list[str]
+) -> None:
+    """INSERT INTO new (cols) SELECT cols FROM old — ids keep v2 semantics."""
+    col_list = ", ".join(f'"{c}"' for c in columns)
+    sql = (
+        f'INSERT INTO "{base_id}"."{new_table_id}" ({col_list}) '
+        f'SELECT {col_list} FROM "{base_id}"."{old_table_id}" ORDER BY "__auto_number"'
+    )
+    async with db_engine.session() as session:
+        await session.execute(text(sql))
+        await session.commit()
+
+
 # ---- physical data table --------------------------------------------------------
 
 

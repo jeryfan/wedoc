@@ -14,6 +14,7 @@ from ...core.validation import read_json_body
 from .schemas import (
     CreateTableBody,
     DbTableNameBody,
+    DuplicateTableBody,
     TableDescriptionBody,
     TableIconBody,
     TableNameBody,
@@ -92,6 +93,40 @@ async def delete_table(baseId: str, tableId: str) -> Response:
 async def permanent_delete_table(baseId: str, tableId: str) -> Response:
     await TableService().permanent_delete_table(baseId, tableId)
     return Response(status_code=200)
+
+
+@router.post("/{tableId}/duplicate", status_code=201)
+@permissions("table|create", "table|read")
+async def duplicate_table(baseId: str, tableId: str, request: Request) -> dict[str, Any]:
+    body = DuplicateTableBody.zod_validate(await read_json_body(request))
+    return await TableService().duplicate_table(baseId, tableId, body.name, body.includeRecords)
+
+
+@router.get("/{tableId}/delete-references", status_code=200)
+@permissions("table|read")
+async def delete_references(tableId: str) -> dict[str, Any]:
+    # link fields do not exist yet — nothing can reference a table.
+    return {"dependentFields": []}
+
+
+@router.get("/{tableId}/duplicate-check", status_code=200)
+@permissions("table|read")
+async def duplicate_check(tableId: str) -> dict[str, Any]:
+    # cross-space link preview: empty until link fields land.
+    return {"affectedFields": []}
+
+
+@router.get("/{tableId}/field/{fieldId}/duplicate-check", status_code=200)
+@permissions("field|create")
+async def duplicate_field_check(tableId: str, fieldId: str) -> dict[str, Any]:
+    # cross-space link preview: empty until link fields land.
+    return {"affectedFields": []}
+
+
+@router.get("/{tableId}/permission", status_code=200)
+@permissions("table|read")
+async def get_permission(tableId: str) -> dict[str, Any]:
+    return await TableService().get_permission()
 
 
 @router.get("/{tableId}", status_code=200)
