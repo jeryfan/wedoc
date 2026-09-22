@@ -113,6 +113,9 @@ class ViewService:
                 first = column_meta[fields[0]["id"]]
                 first["order"] = first.get("order", 0)
                 first["visible"] = True
+            if body.type == "form":
+                for meta in column_meta.values():
+                    meta["visible"] = True
         row = await table_repository.insert_view_row(
             {
                 "id": new_id(IdPrefix.VIEW),

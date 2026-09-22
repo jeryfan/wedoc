@@ -5,6 +5,7 @@ history/form-submit/TQL search land in later slices; attachments need the
 storage stack; collaborators and socket endpoints are M3 realtime.
 """
 
+import base64
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -12,15 +13,27 @@ from typing import Any
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.ids import IdPrefix, new_id
+from ...core.storage import get_public_full_storage_url
 from ..field.repository import get_table_meta_by_id
 from ..table import repository as table_repository
 from ..view.repository import get_view_row
 from . import repository
-from .schemas import RecordBulkPatchBody, RecordCreateBody, RecordPatchBody
+from .schemas import (
+    RecordBulkPatchBody,
+    RecordCreateBody,
+    RecordPatchBody,
+    RecordSubmitBody,
+)
 
 DEFAULT_TAKE = 1000
 JSONB_FIELD_TYPES = {"user", "attachment"}
 ARRAY_FIELD_TYPES = {"multipleSelect"}
+
+# number fields created without explicit options carry these auto-filled
+# display defaults in wedoc's field row; the reference leaves the row NULL and
+# derives the same defaults when serializing, so history must treat them as
+# "not set".
+HISTORY_DEFAULT_OPTIONS = {"number": {"formatting": {"type": "decimal", "precision": 2}}}
 
 FILTER_OPERATORS = {
     "is": "= :{p}",
@@ -54,6 +67,53 @@ def _record_not_found(localization: bool = False) -> ApiError:
         HttpErrorCode.NOT_FOUND,
         {"domainCode": "record.not_found", "domainTags": ["not-found"]},
     )
+
+
+def history_options(field_type: str, options_raw: str | None) -> Any:
+    # ref stores NULL options on the field row and derives display defaults
+    # in the VO; history rows therefore carry options: null for fields that
+    # never set them explicitly (incl. auto-filled type defaults).
+    if not options_raw:
+        return None
+    options = json.loads(options_raw)
+    if not options:
+        return None
+    if options == HISTORY_DEFAULT_OPTIONS.get(field_type):
+        return None
+    return options
+
+
+def build_history_row(
+    *,
+    table_id: str,
+    record_id: str,
+    field_id: str,
+    name: str,
+    field_type: str,
+    options_raw: str | None,
+    cell_value_type: str,
+    before: Any,
+    after: Any,
+    user_id: str,
+) -> dict[str, Any] | None:
+    """One record_history row for a field value change; None when unchanged."""
+    if before == after:
+        return None
+    meta = {
+        "type": field_type,
+        "name": name,
+        "options": history_options(field_type, options_raw),
+        "cellValueType": cell_value_type,
+    }
+    return {
+        "id": new_id(IdPrefix.RECORD_HISTORY),
+        "table_id": table_id,
+        "record_id": record_id,
+        "field_id": field_id,
+        "before": json.dumps({"meta": meta, "data": before}, separators=(",", ":")),
+        "after": json.dumps({"meta": meta, "data": after}, separators=(",", ":")),
+        "created_by": user_id,
+    }
 
 
 class RecordService:
@@ -314,6 +374,7 @@ class RecordService:
         row = await repository.fetch_row(table["base_id"], table_id, record_id, columns)
         if row is None:
             raise _record_not_found()
+        old_row = dict(row)
         updates = {}
         for key, value in body.record.fields.items():
             field = self._field_by_key(fields, key, body.fieldKeyType)
@@ -321,6 +382,7 @@ class RecordService:
         if updates:
             await repository.update_row(table["base_id"], table_id, record_id, updates)
             row = await repository.fetch_row(table["base_id"], table_id, record_id, columns) or row
+            await self._write_history(table_id, record_id, fields, old_row, row)
         return self._echo_vo(record_id, row, fields, body.fieldKeyType)
 
     async def update_records(
@@ -337,6 +399,7 @@ class RecordService:
             row = await repository.fetch_row(table["base_id"], table_id, record_id, columns)
             if row is None:
                 raise _record_not_found()
+            old_row = dict(row)
             updates = {}
             for key, value in fields_ro.items():
                 field = self._field_by_key(fields, key, body.fieldKeyType)
@@ -347,6 +410,7 @@ class RecordService:
                     await repository.fetch_row(table["base_id"], table_id, record_id, columns)
                     or row
                 )
+                await self._write_history(table_id, record_id, fields, old_row, row)
             results.append(self._echo_vo(record_id, row, fields, body.fieldKeyType))
         return results
 
@@ -396,6 +460,148 @@ class RecordService:
                 values[column] = row[column]
         await repository.insert_row(table["base_id"], table_id, values)
         return self._delete_echo(new_record_id, row, fields)
+
+    # ---- record history ------------------------------------------------------
+
+    async def _write_history(
+        self,
+        table_id: str,
+        record_id: str,
+        fields: list[dict[str, Any]],
+        old_row: dict[str, Any],
+        new_row: dict[str, Any],
+    ) -> None:
+        # one row per changed field; equal values (incl. no-op patches) skip.
+        user_id = cls.get("user.id")
+        rows = []
+        for field in fields:
+            column = field["db_field_name"]
+            entry = build_history_row(
+                table_id=table_id,
+                record_id=record_id,
+                field_id=field["id"],
+                name=field["name"],
+                field_type=field["type"],
+                options_raw=field.get("options"),
+                cell_value_type=field["cell_value_type"],
+                before=self._from_db_value(field, old_row.get(column)),
+                after=self._from_db_value(field, new_row.get(column)),
+                user_id=user_id,
+            )
+            if entry:
+                rows.append(entry)
+        if rows:
+            await repository.insert_history(rows)
+
+    async def get_history(
+        self,
+        table_id: str,
+        record_id: str | None,
+        cursor: str | None,
+        start_date: str | None,
+        end_date: str | None,
+        field_ids: list[str] | None,
+        created_by_ids: list[str] | None,
+    ) -> dict[str, Any]:
+        await self._load_context(table_id)
+        cursor_time = cursor_id = None
+        if cursor and cursor.startswith("chs1:"):
+            try:
+                decoded = json.loads(base64.b64decode(cursor[5:]))
+                cursor_time, cursor_id = decoded["t"], decoded["id"]
+            except (ValueError, KeyError, json.JSONDecodeError):
+                cursor_time = cursor_id = None
+        rows = await repository.list_history(
+            table_id,
+            record_id=record_id,
+            start_date=start_date,
+            end_date=end_date,
+            field_ids=field_ids,
+            created_by_ids=created_by_ids,
+            cursor_time=cursor_time,
+            cursor_id=cursor_id,
+            limit=21,
+        )
+        result: dict[str, Any] = {}
+        if len(rows) > 20:
+            rows = rows[:20]
+            last = rows[-1]
+            result["nextCursor"] = "chs1:" + base64.b64encode(
+                json.dumps({"t": _iso(last["created_time"]), "id": last["id"]}).encode()
+            ).decode()
+        created_by = list({r["created_by"] for r in rows})
+        users = await repository.get_users_by_ids(created_by) if created_by else []
+        user_map = {
+            u["id"]: {
+                "id": u["id"],
+                "name": u["name"],
+                "email": u["email"],
+                "avatar": get_public_full_storage_url(u["avatar"]) if u["avatar"] else None,
+            }
+            for u in users
+        }
+        result["historyList"] = [
+            {
+                "id": r["id"],
+                "tableId": r["table_id"],
+                "recordId": r["record_id"],
+                "fieldId": r["field_id"],
+                "before": json.loads(r["before"]),
+                "after": json.loads(r["after"]),
+                "createdTime": _iso(r["created_time"]),
+                "createdBy": r["created_by"],
+            }
+            for r in rows
+        ]
+        result["userMap"] = user_map
+        return result
+
+    # ---- form submit ---------------------------------------------------------
+
+    async def form_submit(self, table_id: str, body: RecordSubmitBody) -> dict[str, Any]:
+        table, fields = await self._load_context(table_id)
+        view = await get_view_row(table_id, body.viewId)
+        if view is None:
+            raise ApiError(
+                "Invalid ViewId",
+                HttpErrorCode.VALIDATION_ERROR,
+                {"domainCode": "validation.invalid", "domainTags": ["validation"]},
+            )
+        if view["type"] != "form":
+            raise ApiError(
+                "View is not a form",
+                HttpErrorCode.RESTRICTED_RESOURCE,
+                {"domainCode": "view.type_not_form", "domainTags": ["forbidden"]},
+            )
+        column_meta = json.loads(view.get("column_meta") or "{}")
+        field_id_set = {f["id"] for f in fields}
+        visible_ids = {
+            fid for fid, meta in column_meta.items() if meta.get("visible") is True
+        } & field_id_set
+        if (not visible_ids and body.fields) or any(
+            key not in visible_ids for key in body.fields
+        ):
+            raise ApiError(
+                "The form contains hidden fields, submission not allowed.",
+                HttpErrorCode.RESTRICTED_RESOURCE,
+                {
+                    "domainCode": "view.hidden_fields_submission_not_allowed",
+                    "domainTags": ["forbidden"],
+                },
+            )
+        record_id = new_id(IdPrefix.RECORD)
+        user_id = cls.get("user.id")
+        values: dict[str, Any] = {
+            "__id": record_id,
+            "__created_by": user_id,
+            "__last_modified_by": user_id,
+            "__version": 1,
+        }
+        for key, value in body.fields.items():
+            field = self._field_by_key(fields, key, "id")
+            values[field["db_field_name"]] = self._to_db_value(field, value)
+        await repository.insert_row(table["base_id"], table_id, values)
+        return {"id": record_id, "fields": body.fields}
 
     async def get_status(self, table_id: str, record_id: str) -> dict[str, Any]:
         table, _fields = await self._load_context(table_id)

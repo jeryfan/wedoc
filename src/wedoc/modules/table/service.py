@@ -18,6 +18,8 @@ from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.ids import IdPrefix, new_id
 from ...db import provider as ddl
+from ..record.repository import insert_history as insert_record_history
+from ..record.service import build_history_row
 from . import repository
 from .schemas import PRIMARY_SUPPORTED_TYPES
 
@@ -350,6 +352,7 @@ class TableService:
         columns = ["__id", "__created_by", "__version"] + [f["dbFieldName"] for f in fields]
         value_rows: list[list[Any]] = []
         records_vo: list[dict[str, Any]] = []
+        history_rows: list[dict[str, Any]] = []
         for record_ro in record_ros:
             raw = record_ro if isinstance(record_ro, dict) else record_ro.model_dump()
             record_fields = raw.get("fields") or {}
@@ -365,9 +368,29 @@ class TableService:
                         value = record_fields.get(field["id"])
                 values.append(value)
                 vo_fields[field["name"]] = value
+                # initial values are logged as cell history (null -> value) by the
+                # table-create path; records created via the record open API are not.
+                entry = build_history_row(
+                    table_id=table_id,
+                    record_id=record_id,
+                    field_id=field["id"],
+                    name=field["name"],
+                    field_type=field["type"],
+                    options_raw=json.dumps(field.get("options"), separators=(",", ":"))
+                    if field.get("options") is not None
+                    else None,
+                    cell_value_type=CELL_VALUE_TYPES[field["type"]],
+                    before=None,
+                    after=value,
+                    user_id=user_id,
+                )
+                if entry:
+                    history_rows.append(entry)
             value_rows.append(values)
             records_vo.append({"id": record_id, "fields": vo_fields})
         await repository.insert_data_rows(base_id, table_id, columns, value_rows)
+        if history_rows:
+            await insert_record_history(history_rows)
         return records_vo
 
     @staticmethod

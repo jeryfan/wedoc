@@ -32,3 +32,9 @@ class RecordBulkPatchBody(ZodModel):
     records: list[RecordBulkPatchItem]
     fieldKeyType: FieldKeyTypeStr = "name"
     typecast: bool | None = None
+
+
+class RecordSubmitBody(ZodModel):
+    viewId: str
+    fields: dict[str, Any]
+    typecast: bool | None = None
