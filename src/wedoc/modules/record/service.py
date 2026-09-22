@@ -24,6 +24,7 @@ from .schemas import (
     RecordPatchBody,
     RecordSubmitBody,
 )
+from .tql import TqlParseError, parse_tql
 
 DEFAULT_TAKE = 1000
 JSONB_FIELD_TYPES = {"user", "attachment"}
@@ -40,11 +41,26 @@ FILTER_OPERATORS = {
     "isNot": "IS DISTINCT FROM :{p}",
     "contains": "LIKE :{p}",
     "doesNotContain": "NOT LIKE :{p}",
-    "gt": "> :{p}",
-    "gte": ">= :{p}",
-    "lt": "< :{p}",
-    "lte": "<= :{p}",
+    "isGreater": "> :{p}",
+    "isGreaterEqual": ">= :{p}",
+    "isLess": "< :{p}",
+    "isLessEqual": "<= :{p}",
 }
+
+# operator enum accepted by the reference filter schema; anything outside it
+# fails request validation before reaching the query builder.
+_FILTER_ENUM = set(FILTER_OPERATORS) | {"isEmpty", "isNotEmpty"}
+
+# operators that the reference rejects at query-build time for scalar fields.
+_UNSUPPORTED_FIELD_OPS = {"isAnyOf", "isNoneOf", "hasAnyOf", "hasAllOf"}
+
+
+def _invalid_filter_operator() -> ApiError:
+    return ApiError(
+        "Invalid record condition operator for field",
+        HttpErrorCode.VALIDATION_ERROR,
+        {"domainCode": "validation.invalid", "domainTags": ["validation"]},
+    )
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -229,6 +245,16 @@ class RecordService:
 
     # ---- query compilation -------------------------------------------------
 
+    def _resolve_field(
+        self, fields: list[dict[str, Any]], key: str
+    ) -> dict[str, Any] | None:
+        # filter/sort field refs accept id or name; unknown refs are dropped
+        # silently by the reference query builder (match-all), never 404.
+        for field in fields:
+            if field["id"] == key or field["name"] == key:
+                return field
+        return None
+
     def _compile_filter(
         self,
         fields: list[dict[str, Any]],
@@ -248,17 +274,34 @@ class RecordService:
                     clauses.append(f"({nested})")
                 continue
             operator = item.get("operator")
-            template = FILTER_OPERATORS.get(operator)
-            if template is None:
+            if operator in _UNSUPPORTED_FIELD_OPS:
+                raise _invalid_filter_operator()
+            if operator not in _FILTER_ENUM:
                 continue
-            field = self._field_by_key(fields, item.get("fieldId", ""), "id")
+            field = self._resolve_field(fields, item.get("fieldId", ""))
+            if field is None:
+                continue
+            column = f'"{field["db_field_name"]}"'
             value = item.get("value")
+            if operator == "isEmpty" or (operator == "is" and value is None):
+                if field["cell_value_type"] == "string":
+                    clauses.append(f"({column} IS NULL OR {column} = '')")
+                else:
+                    clauses.append(f"{column} IS NULL")
+                continue
+            if operator == "isNotEmpty" or (operator == "isNot" and value is None):
+                if field["cell_value_type"] == "string":
+                    clauses.append(f"({column} IS NOT NULL AND {column} != '')")
+                else:
+                    clauses.append(f"{column} IS NOT NULL")
+                continue
+            template = FILTER_OPERATORS[operator]
             if isinstance(value, str) and operator in ("contains", "doesNotContain"):
                 value = f"%{value}%"
             param = f"f{counter[0]}"
             counter[0] += 1
             params[param] = self._to_db_value(field, value)
-            clauses.append(f'"{field["db_field_name"]}" {template.format(p=param)}')
+            clauses.append(f"{column} {template.format(p=param)}")
         return joiner.join(clauses)
 
     def _compile_sort(
@@ -268,10 +311,12 @@ class RecordService:
             return ""
         terms = []
         for item in sort_items:
-            field = self._field_by_key(fields, item.get("fieldId", ""), "id")
+            field = self._resolve_field(fields, item.get("fieldId", ""))
+            if field is None:
+                continue
             direction = "DESC" if item.get("order") == "desc" else "ASC"
             terms.append(f'"{field["db_field_name"]}" {direction}')
-        return " ORDER BY " + ", ".join(terms)
+        return " ORDER BY " + ", ".join(terms) if terms else ""
 
     # ---- endpoints ---------------------------------------------------------
 
@@ -294,19 +339,77 @@ class RecordService:
         view_id: str | None = None,
         filter_param: dict[str, Any] | None = None,
         sort_param: list[dict[str, Any]] | None = None,
+        order_by: list[dict[str, Any]] | None = None,
+        tql: str | None = None,
+        search: list[Any] | None = None,
+        ignore_view_query: bool = False,
         take: int = DEFAULT_TAKE,
         skip: int = 0,
         cursor: str | None = None,
     ) -> dict[str, Any]:
         table, fields = await self._load_context(table_id)
 
+        # search arrives as the raw repeated-key values: [value, field, isExact].
+        # A single value fails the tuple schema before any querying happens.
+        if search is not None and len(search) < 2:
+            raise ApiError(
+                'Validation error: Invalid input: expected tuple, received string'
+                ' at "search"',
+                HttpErrorCode.VALIDATION_ERROR,
+            )
+        search_filter: dict[str, Any] | None = None
+        if search is not None and len(search) == 3 and search[2] in ("true", True):
+            # exact search compiles to a plain equality predicate on the field;
+            # an unknown field silently drops the predicate (match-all).
+            if self._resolve_field(fields, str(search[1])) is not None:
+                search_filter = {
+                    "conjunction": "and",
+                    "filterSet": [
+                        {"fieldId": search[1], "operator": "is", "value": search[0]}
+                    ],
+                }
+        # the non-exact branch searches an index the reference build never
+        # populates, so it matches every row: no predicate is added.
+
         view_filter: dict[str, Any] | None = None
         view_sort: list[dict[str, Any]] | None = None
         if view_id:
             view = await get_view_row(table_id, view_id)
-            if view is not None:
+            if view is None:
+                raise ApiError(
+                    f"View not found: {view_id}",
+                    HttpErrorCode.NOT_FOUND,
+                    {"domainCode": "view.not_found", "domainTags": ["not-found"]},
+                )
+            if not ignore_view_query:
                 view_filter = json.loads(view["filter"]) if view.get("filter") else None
                 view_sort = json.loads(view["sort"])["sortObjs"] if view.get("sort") else None
+
+        # filterByTql overwrites the filter param (ref TqlPipe assigns it).
+        query_filter = filter_param
+        if tql:
+            try:
+                query_filter = parse_tql(tql)
+            except TqlParseError as exc:
+                raise ApiError(
+                    f"TQL parse error, {exc}",
+                    HttpErrorCode.VALIDATION_ERROR,
+                ) from None
+
+        filter_parts = []
+        if view_filter:
+            filter_parts.append(view_filter)
+        if query_filter:
+            filter_parts.append(query_filter)
+        if search_filter:
+            filter_parts.append(search_filter)
+        if len(filter_parts) > 1:
+            filter_obj: dict[str, Any] | None = {
+                "conjunction": "and",
+                "filterSet": filter_parts,
+            }
+        else:
+            filter_obj = filter_parts[0] if filter_parts else None
 
         selected = fields
         if projection:
@@ -315,7 +418,6 @@ class RecordService:
         params: dict[str, Any] = {}
         counter = [0]
         clauses = []
-        filter_obj = filter_param if filter_param is not None else view_filter
         compiled = self._compile_filter(fields, filter_obj, params, counter)
         if compiled:
             clauses.append(compiled)
@@ -323,10 +425,11 @@ class RecordService:
             clauses.append("__auto_number > :cursor")
             params["cursor"] = int(cursor)
         where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
-        # ref silently ignores the top-level `sort` query param (probed with
-        # asc/desc/sortObjs formats, all fall back to default order); only the
-        # view's own sort applies via viewId.
-        order_sql = self._compile_sort(fields, view_sort)
+        # the legacy `sort` param is ignored by ref; `orderBy` overrides the
+        # view's sort, which in turn overrides the default auto-number order.
+        order_sql = self._compile_sort(fields, order_by) or self._compile_sort(
+            fields, view_sort
+        )
 
         rows = await repository.list_rows(
             table["base_id"],
@@ -343,6 +446,23 @@ class RecordService:
             rows = rows[:take]
             result["extra"] = {"nextCursor": str(rows[-1]["__auto_number"])}
         result["records"] = [self._full_vo(r, selected, field_key_type) for r in rows]
+        if search is not None and len(search) >= 2:
+            # search never removes rows (exact search already filtered above);
+            # it only annotates the page with the cells that matched.
+            hit_field = self._resolve_field(fields, str(search[1]))
+            hits: list[dict[str, Any]] = []
+            if hit_field is not None:
+                column = hit_field["db_field_name"]
+                exact = len(search) == 3 and search[2] in ("true", True)
+                needle = str(search[0])
+                for row in rows:
+                    raw = row.get(column)
+                    if raw is None:
+                        continue
+                    matched = str(raw) == needle if exact else needle.lower() in str(raw).lower()
+                    if matched:
+                        hits.append({"fieldId": hit_field["id"], "recordId": row["__id"]})
+            result.setdefault("extra", {})["searchHitIndex"] = hits
         return result
 
     async def create_records(self, table_id: str, body: RecordCreateBody) -> dict[str, Any]:

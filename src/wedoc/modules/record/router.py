@@ -42,6 +42,7 @@ async def list_records(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     take = int(params.get("take") or 1000)
     skip = int(params.get("skip") or 0)
+    ignore_view_query = (params.get("ignoreViewQuery") or "").lower() == "true"
     return await RecordService().list_records(
         tableId,
         field_key_type=params.get("fieldKeyType") or "name",
@@ -49,6 +50,10 @@ async def list_records(tableId: str, request: Request) -> dict[str, Any]:
         view_id=params.get("viewId"),
         filter_param=_json_param(params.get("filter")),
         sort_param=_json_param(params.get("sort")),
+        order_by=_json_param(params.get("orderBy")),
+        tql=params.get("filterByTql"),
+        search=params.getlist("search") or None,
+        ignore_view_query=ignore_view_query,
         take=take,
         skip=skip,
         cursor=params.get("cursor"),
