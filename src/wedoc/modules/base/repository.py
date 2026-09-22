@@ -18,6 +18,8 @@ def _row(instance: Any) -> dict[str, Any]:
 
 
 async def insert_base(fields: dict[str, Any]) -> dict[str, Any]:
+    # prisma @updatedAt also stamps the row on INSERT.
+    fields = {**fields, "last_modified_time": datetime.now(UTC).replace(tzinfo=None)}
     async with db_engine.session() as session:
         row = (
             (
