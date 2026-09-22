@@ -16,6 +16,7 @@ from ..collaborator.service import CollaboratorService
 from ..space import repository
 
 RESOURCE_SPACE = "space"
+RESOURCE_BASE = "base"
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -41,9 +42,11 @@ class InvitationService:
         origin = get_settings().public_origin
         return f"{origin}/invite?invitationId={invitation_id}&invitationCode={code}"
 
-    async def generate_invitation_link(self, space_id: str, role: str) -> dict[str, Any]:
+    async def generate_invitation_link(
+        self, resource_id: str, role: str, resource_type: str = RESOURCE_SPACE
+    ) -> dict[str, Any]:
         await self.collaborators.validate_user_add_role(
-            cls.get("user.id"), role, space_id, RESOURCE_SPACE
+            cls.get("user.id"), role, resource_id, resource_type
         )
         invitation_id = new_id(IdPrefix.INVITATION)
         code = generate_invitation_code(invitation_id)
@@ -51,8 +54,8 @@ class InvitationService:
             {
                 "id": invitation_id,
                 "invitation_code": code,
-                "space_id": space_id,
-                "base_id": None,
+                "space_id": resource_id if resource_type == RESOURCE_SPACE else None,
+                "base_id": resource_id if resource_type == RESOURCE_BASE else None,
                 "role": role,
                 "type": "link",
                 "expired_time": None,
@@ -68,8 +71,10 @@ class InvitationService:
             "invitationCode": code,
         }
 
-    async def list_invitation_links(self, space_id: str) -> list[dict[str, Any]]:
-        rows = await repository.list_invitation_link_rows(space_id)
+    async def list_invitation_links(
+        self, resource_id: str, resource_type: str = RESOURCE_SPACE
+    ) -> list[dict[str, Any]]:
+        rows = await repository.list_invitation_link_rows(resource_id, resource_type)
         return [
             {
                 "invitationId": row["id"],
@@ -83,20 +88,29 @@ class InvitationService:
         ]
 
     async def update_invitation_link(
-        self, space_id: str, invitation_id: str, role: str
+        self,
+        resource_id: str,
+        invitation_id: str,
+        role: str,
+        resource_type: str = RESOURCE_SPACE,
     ) -> dict[str, Any]:
         await self.collaborators.validate_user_add_role(
-            cls.get("user.id"), role, space_id, RESOURCE_SPACE
+            cls.get("user.id"), role, resource_id, resource_type
         )
-        row = await repository.get_invitation_link_row(invitation_id, space_id)
+        row = await repository.get_invitation_link_row(invitation_id, resource_id, resource_type)
         if row is None:
             raise RuntimeError("Record to update not found")
         updated = await repository.update_invitation_row(invitation_id, {"role": role})
         assert updated is not None
         return {"invitationId": updated["id"], "role": role}
 
-    async def delete_invitation_link(self, space_id: str, invitation_id: str) -> None:
-        row = await repository.get_invitation_link_row(invitation_id, space_id)
+    async def delete_invitation_link(
+        self,
+        resource_id: str,
+        invitation_id: str,
+        resource_type: str = RESOURCE_SPACE,
+    ) -> None:
+        row = await repository.get_invitation_link_row(invitation_id, resource_id, resource_type)
         if row is None:
             raise RuntimeError("Record to update not found")
         await repository.update_invitation_row(

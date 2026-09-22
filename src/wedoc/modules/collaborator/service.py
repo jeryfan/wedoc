@@ -444,3 +444,202 @@ class CollaboratorService:
                 principal_id,
                 principal_type,
             )
+
+    # -- base-facing surface -----------------------------------------------------
+
+    async def get_shared_base(self) -> list[dict[str, Any]]:
+        user_id = cls.get("user.id")
+        rows = await repository.list_collaborator_rows_by_principals([user_id])
+        base_rows = [r for r in rows if r["resource_type"] == RESOURCE_BASE]
+        if not base_rows:
+            return []
+        role_map: dict[str, str] = {}
+        base_ids: list[str] = []
+        for row in base_rows:
+            current = role_map.get(row["resource_id"])
+            if current is None or can_manage_role(row["role_name"], current):
+                role_map[row["resource_id"]] = row["role_name"]
+            base_ids.append(row["resource_id"])
+        from ..base import repository as base_repository
+
+        bases = await base_repository.list_base_rows_by_ids(base_ids)
+        if not bases:
+            return []
+        space_ids = list({b["space_id"] for b in bases})
+        spaces = await repository.list_space_rows_by_ids(space_ids)
+        space_map = {s["id"]: s["name"] for s in spaces}
+        users = await repository.list_user_rows_by_ids(list({b["created_by"] for b in bases}))
+        user_map = {u["id"]: u for u in users}
+        result = []
+        for base in bases:
+            created_user = user_map.get(base["created_by"])
+            result.append(
+                {
+                    "id": base["id"],
+                    "name": base["name"],
+                    "role": role_map[base["id"]],
+                    "icon": base["icon"],
+                    "spaceId": base["space_id"],
+                    "spaceName": space_map.get(base["space_id"]),
+                    "collaboratorType": RESOURCE_BASE,
+                    "lastModifiedTime": _iso(base["last_modified_time"]),
+                    "createdTime": _iso(base["created_time"]),
+                    "createdBy": base["created_by"],
+                    "createdUser": {
+                        "id": created_user["id"],
+                        "name": created_user["name"],
+                        "avatar": _public_avatar(created_user.get("avatar")),
+                    }
+                    if created_user
+                    else None,
+                }
+            )
+        return result
+
+    async def _base_tree_rows(
+        self, base_id: str
+    ) -> tuple[str, list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        from ..base import repository as base_repository
+
+        base = await base_repository.get_base_row(base_id)
+        if base is None:
+            raise ApiError("Base not found", HttpErrorCode.NOT_FOUND)
+        rows = await repository.list_collaborator_rows([base_id, base["space_id"]])
+        users = await repository.list_user_rows_by_ids(list({r["principal_id"] for r in rows}))
+        user_map = {u["id"]: u for u in users}
+        return base["space_id"], rows, user_map
+
+    @staticmethod
+    def _filter_base_rows(
+        rows: list[dict[str, Any]],
+        user_map: dict[str, dict[str, Any]],
+        options: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        include_system = options.get("includeSystem")
+        search = (options.get("search") or "").lower()
+        principal_type = options.get("type")
+        roles = options.get("role")
+        out = []
+        for row in rows:
+            user = user_map.get(row["principal_id"])
+            # whereNotNull('users.id'): rows whose principal is not a user drop out.
+            if user is None:
+                continue
+            if not include_system and user.get("is_system"):
+                continue
+            if principal_type and row["principal_type"] != principal_type:
+                continue
+            if roles and row["role_name"] not in roles:
+                continue
+            if search:
+                name = user.get("name") or ""
+                email = user.get("email") or ""
+                if search not in name.lower() and search not in email.lower():
+                    continue
+            out.append(row)
+        return out
+
+    @staticmethod
+    def _map_base_item(row: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "type": PRINCIPAL_USER,
+            "userId": row["principal_id"],
+            "userName": user.get("name"),
+            "email": user.get("email"),
+            "avatar": _public_avatar(user.get("avatar")),
+            "role": row["role_name"],
+            "createdTime": _iso(row["created_time"]),
+            "lastSignTime": _iso(user.get("last_sign_time")),
+            "resourceType": row["resource_type"],
+        }
+        if user.get("is_system"):
+            item["isSystem"] = True
+        return item
+
+    async def get_list_by_base(
+        self, base_id: str, options: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        _, rows, user_map = await self._base_tree_rows(base_id)
+        visible = self._filter_base_rows(rows, user_map, options)
+        # ref: orderBy collaborator.created_time desc by default.
+        visible.sort(key=lambda r: r["principal_id"])
+        visible.sort(key=lambda r: r["created_time"], reverse=True)
+        skip = options.get("skip") or 0
+        take = options.get("take") if options.get("take") is not None else 50
+        paged = visible[skip : skip + take]
+        return [self._map_base_item(row, user_map[row["principal_id"]]) for row in paged]
+
+    async def get_total_base(self, base_id: str, options: dict[str, Any]) -> int:
+        _, rows, user_map = await self._base_tree_rows(base_id)
+        return len(self._filter_base_rows(rows, user_map, options))
+
+    async def get_user_collaborators(
+        self, base_id: str, options: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        _, rows, user_map = await self._base_tree_rows(base_id)
+        visible = self._filter_base_rows(rows, user_map, options)
+        reverse = (options.get("orderBy") or "desc") == "desc"
+        visible.sort(key=lambda r: r["principal_id"])
+        visible.sort(key=lambda r: r["created_time"], reverse=reverse)
+        skip = options.get("skip") or 0
+        take = options.get("take") if options.get("take") is not None else 50
+        paged = visible[skip : skip + take]
+        return [
+            {
+                "id": user_map[row["principal_id"]]["id"],
+                "name": user_map[row["principal_id"]]["name"],
+                "email": user_map[row["principal_id"]]["email"],
+                "avatar": _public_avatar(user_map[row["principal_id"]].get("avatar")),
+            }
+            for row in paged
+        ]
+
+    async def add_base_collaborators(
+        self, base_id: str, collaborators: list[dict[str, str]], role: str
+    ) -> dict[str, int]:
+        user_id = cls.get("user.id")
+        await self.validate_user_add_role(user_id, role, base_id, RESOURCE_BASE)
+        user_ids = [c["principalId"] for c in collaborators if c["principalType"] == "user"]
+        await self._validate_collaborator_users(user_ids)
+        return await self.create_base_collaborator(
+            collaborators=collaborators, base_id=base_id, role=role, created_by=user_id
+        )
+
+    async def create_base_collaborator(
+        self,
+        collaborators: list[dict[str, str]],
+        base_id: str,
+        role: str,
+        created_by: str | None = None,
+    ) -> dict[str, int]:
+        current_user_id = created_by or cls.get("user.id")
+        from ..base import repository as base_repository
+
+        base = await base_repository.get_base_row(base_id, include_deleted=True)
+        if base is None:
+            raise ApiError("Base not found", HttpErrorCode.NOT_FOUND)
+        pairs = {(c["principalId"], c["principalType"]) for c in collaborators}
+        rows = await repository.list_collaborator_rows([base_id, base["space_id"]])
+        if any((r["principal_id"], r["principal_type"]) in pairs for r in rows):
+            raise ApiError(
+                "Collaborator has already existed in base",
+                HttpErrorCode.VALIDATION_ERROR,
+                {"localization": {"i18nKey": "httpErrors.collaborator.alreadyExistedInBase"}},
+            )
+        now = datetime.now(UTC).replace(tzinfo=None)
+        await repository.insert_collaborators(
+            [
+                {
+                    "id": random_string(16),
+                    "resource_id": base_id,
+                    "resource_type": RESOURCE_BASE,
+                    "role_name": role,
+                    "principal_id": c["principalId"],
+                    "principal_type": c["principalType"],
+                    "created_by": current_user_id,
+                    "created_time": now,
+                }
+                for c in collaborators
+            ]
+        )
+        return {"count": len(collaborators)}

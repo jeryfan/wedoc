@@ -357,14 +357,21 @@ async def insert_invitation(fields: dict[str, Any]) -> dict[str, Any]:
         return dict(row)
 
 
-async def list_invitation_link_rows(space_id: str) -> list[dict[str, Any]]:
+def _resource_column(resource_type: str) -> Any:
+    return Invitation.base_id if resource_type == "base" else Invitation.space_id
+
+
+async def list_invitation_link_rows(
+    resource_id: str, resource_type: str = "space"
+) -> list[dict[str, Any]]:
+    column = _resource_column(resource_type)
     async with db_engine.session() as session:
         rows = (
             (
                 await session.execute(
                     select(Invitation)
                     .where(
-                        Invitation.space_id == space_id,
+                        column == resource_id,
                         Invitation.type == "link",
                         Invitation.deleted_time.is_(None),
                     )
@@ -377,14 +384,17 @@ async def list_invitation_link_rows(space_id: str) -> list[dict[str, Any]]:
     return [{c.name: getattr(r, c.name) for c in Invitation.__table__.columns} for r in rows]
 
 
-async def get_invitation_link_row(invitation_id: str, space_id: str) -> dict[str, Any] | None:
+async def get_invitation_link_row(
+    invitation_id: str, resource_id: str, resource_type: str = "space"
+) -> dict[str, Any] | None:
+    column = _resource_column(resource_type)
     async with db_engine.session() as session:
         row = (
             (
                 await session.execute(
                     select(Invitation).where(
                         Invitation.id == invitation_id,
-                        Invitation.space_id == space_id,
+                        column == resource_id,
                         Invitation.type == "link",
                     )
                 )
@@ -417,9 +427,10 @@ async def update_invitation_row(
         return dict(row) if row else None
 
 
-async def delete_invitation_rows_by_space(space_id: str) -> None:
+async def delete_invitation_rows(resource_id: str, resource_type: str = "space") -> None:
+    column = _resource_column(resource_type)
     async with db_engine.session() as session:
-        await session.execute(delete(Invitation).where(Invitation.space_id == space_id))
+        await session.execute(delete(Invitation).where(column == resource_id))
         await session.commit()
 
 

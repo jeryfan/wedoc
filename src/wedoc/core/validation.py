@@ -53,6 +53,14 @@ def zod_email(value: str) -> str:
 ZodEmailStr = Annotated[str, AfterValidator(zod_email)]
 
 
+@dataclass(frozen=True)
+class ZodNullable:
+    """Annotated metadata marker: zod `.nullable()` — explicit null is accepted."""
+
+
+ZodNullableStr = Annotated[str | None, ZodNullable()]
+
+
 def zod_password_checks(value: str, *, strength: bool) -> str:
     """passwordSchema (min 8) + optional signupPasswordSchema strength regex."""
     messages: list[str] = []
@@ -314,8 +322,10 @@ def zod_validate(model: type[BaseModel], data: Any) -> Any:
     # `X | None` accepts both, so reject nulls up front with zod's wording.
     if isinstance(data, dict):
         for name, field_info in model.model_fields.items():
+            nullable = any(isinstance(m, ZodNullable) for m in field_info.metadata)
             if (
-                name in data
+                not nullable
+                and name in data
                 and data[name] is None
                 and not field_info.is_required()
                 and field_info.default is None

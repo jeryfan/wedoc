@@ -259,7 +259,7 @@ class SpaceService:
                 )
             )
             await session.commit()
-        await repository.delete_invitation_rows_by_space(space_id)
+        await repository.delete_invitation_rows(space_id)
         await repository.delete_space_row(space_id)
 
     # -- base listing --------------------------------------------------------------
@@ -303,6 +303,8 @@ class SpaceService:
                 "role": view["roleMap"].get(base["id"]) or view["roleMap"].get(space_id),
                 "isShared": base["id"] in shared_ids,
             }
+            if base.get("v2_enabled"):
+                item["v2Status"] = {"useV2": True, "reason": "new_base"}
             if created_user:
                 item["createdUser"] = {
                     "id": created_user["id"],

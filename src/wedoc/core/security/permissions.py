@@ -557,7 +557,11 @@ class PermissionService:
                 await session.execute(select(_base).where(_base.c.id == base_id))
             ).mappings().first()
         if not base or (base["deleted_time"] and not include_inactive_resource):
-            raise ApiError("Base not found", HttpErrorCode.NOT_FOUND)
+            raise ApiError(
+                "Base not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.base.notFound"}},
+            )
         space_id = base["space_id"]
         cls.set("spaceId", space_id)
         return space_id
