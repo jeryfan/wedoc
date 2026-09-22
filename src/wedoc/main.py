@@ -132,6 +132,7 @@ def create_app() -> FastAPI:
     from .modules.auth.social import social_router
     from .modules.base.router import router as base_router
     from .modules.base_node.router import router as base_node_router
+    from .modules.field.router import router as field_router
     from .modules.health import router as health_router
     from .modules.invitation.router import router as invitation_router
     from .modules.space.router import router as space_router
@@ -146,6 +147,7 @@ def create_app() -> FastAPI:
     app.include_router(base_node_router)
     app.include_router(invitation_router)
     app.include_router(table_router)
+    app.include_router(field_router)
     social = social_router(settings)
     if social.routes:
         app.include_router(social)
