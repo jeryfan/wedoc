@@ -23,3 +23,85 @@ def create_schema_sql(schema_name: str) -> list[str]:
 def drop_schema_sql(schema_name: str) -> str:
     """`DROP SCHEMA IF EXISTS ... CASCADE`, used on permanent base deletion."""
     return f"DROP SCHEMA IF EXISTS {_quoted_identifier(schema_name)} CASCADE"
+
+
+# ---- per-table physical DDL (ports db-provider postgres table utils) ---------
+
+
+def convert_name_to_valid_character(name: str, max_length: int = 10) -> str:
+    """ports utils/name-conversion.ts: slugify keeping [a-zA-Z0-9_], '_' separator."""
+    out: list[str] = []
+    prev_sep = False
+    prev_lower_or_digit = False
+    for ch in name:
+        if ch.isascii() and (ch.isalnum() or ch == "_"):
+            # slugify decamelizes: camelCase words split at case boundaries.
+            if ch.isupper() and prev_lower_or_digit and not prev_sep:
+                out.append("_")
+            out.append(ch)
+            prev_sep = False
+            prev_lower_or_digit = ch.islower() or ch.isdigit()
+        else:
+            if not prev_sep:
+                out.append("_")
+                prev_sep = True
+            prev_lower_or_digit = False
+    cleaned = "".join(out).strip("_")
+    if not cleaned or set(cleaned) == {"_"}:
+        return "unnamed"
+    if not cleaned[0].isalpha():
+        cleaned = "t" + cleaned
+    return cleaned[:max_length]
+
+
+def _qualified(schema_name: str, table_name: str) -> str:
+    return f"{_quoted_identifier(schema_name)}.{_quoted_identifier(table_name)}"
+
+
+def create_data_table_sql(schema_name: str, table_name: str) -> list[str]:
+    """System columns of a fresh data table (knex schema builder output)."""
+    table = _qualified(schema_name, table_name)
+    return [
+        f"CREATE TABLE {table} ("
+        '"__id" text NOT NULL, '
+        '"__auto_number" serial PRIMARY KEY, '
+        '"__created_time" timestamptz NOT NULL DEFAULT now(), '
+        '"__last_modified_time" timestamptz NULL, '
+        '"__created_by" text NOT NULL, '
+        '"__last_modified_by" text NULL, '
+        '"__version" integer NOT NULL, '
+        f'CONSTRAINT "{table_name}___id_key" UNIQUE ("__id"))'
+    ]
+
+
+def drop_data_table_sql(schema_name: str, table_name: str) -> str:
+    return f"DROP TABLE IF EXISTS {_qualified(schema_name, table_name)}"
+
+
+# field type -> physical column type; extended with the field module later.
+FIELD_DB_TYPES: dict[str, str] = {
+    "singleLineText": "text",
+    "longText": "text",
+    "number": "double precision",
+    "singleSelect": "text",
+    "multipleSelect": "text[]",
+    "checkbox": "boolean",
+    "rating": "double precision",
+    "date": "timestamptz",
+    "autoNumber": "double precision",
+    "createdTime": "timestamptz",
+    "lastModifiedTime": "timestamptz",
+    "user": "jsonb",
+    "attachment": "jsonb",
+    "button": "text",
+}
+
+
+def add_field_column_sql(
+    schema_name: str, table_name: str, db_field_name: str, field_type: str
+) -> str:
+    column_type = FIELD_DB_TYPES[field_type]
+    return (
+        f"ALTER TABLE {_qualified(schema_name, table_name)} "
+        f"ADD COLUMN {_quoted_identifier(db_field_name)} {column_type} NULL"
+    )
