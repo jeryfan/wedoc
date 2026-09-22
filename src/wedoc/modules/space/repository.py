@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import delete, func, select, update
 
 from ...db import engine as db_engine
-from ...db.models_meta import Base, Collaborator, Invitation, Space, User
+from ...db.models_meta import Base, Collaborator, Invitation, InvitationRecord, Space, User
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -432,6 +432,41 @@ async def delete_invitation_rows(resource_id: str, resource_type: str = "space")
     async with db_engine.session() as session:
         await session.execute(delete(Invitation).where(column == resource_id))
         await session.commit()
+
+
+async def get_invitation_row(invitation_id: str) -> dict[str, Any] | None:
+    async with db_engine.session() as session:
+        row = (
+            (
+                await session.execute(
+                    select(Invitation).where(
+                        Invitation.id == invitation_id, Invitation.deleted_time.is_(None)
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if row is None:
+        return None
+    return {c.name: getattr(row, c.name) for c in Invitation.__table__.columns}
+
+
+async def insert_invitation_record(fields: dict[str, Any]) -> dict[str, Any]:
+    async with db_engine.session() as session:
+        row = (
+            (
+                await session.execute(
+                    InvitationRecord.__table__.insert()
+                    .values(**fields)
+                    .returning(InvitationRecord.__table__)
+                )
+            )
+            .mappings()
+            .first()
+        )
+        await session.commit()
+        return dict(row)
 
 
 # ---- users ------------------------------------------------------------------
