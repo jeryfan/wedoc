@@ -17,7 +17,7 @@ from ...db import provider as ddl
 from ..table import repository as table_repository
 from ..table.service import CELL_VALUE_TYPES, DB_FIELD_TYPES
 from . import repository
-from .schemas import DuplicateFieldBody, FieldCreateBody, FieldPatchBody
+from .schemas import DuplicateFieldBody, FieldConvertBody, FieldCreateBody, FieldPatchBody
 
 # select-field color auto-assignment order (Colors enum declaration order).
 COLORS = [
@@ -380,3 +380,90 @@ class FieldService:
             "dependentFields": [],
         }
         return {field_id: dict(empty) for field_id in field_ids}
+
+    async def plan_create(self, table_id: str, body: FieldCreateBody) -> dict[str, Any]:
+        await self._load_table(table_id)
+        return {"estimateTime": 0, "updateCellCount": 0}
+
+    def _delete_plan_graph(
+        self, table_id: str, table_name: str, field: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "nodes": [
+                {
+                    "id": field["id"],
+                    "label": field["name"],
+                    "comboId": table_id,
+                    "fieldType": field["type"],
+                    "isSelected": True,
+                }
+            ],
+            "edges": [],
+            "combos": [{"id": table_id, "label": table_name}],
+        }
+
+    async def plan_delete(self, table_id: str, field_id: str) -> dict[str, Any]:
+        table = await self._load_table(table_id)
+        field = await repository.get_field_row(table_id, field_id)
+        if field is None:
+            raise ApiError(
+                f"Field {field_id} not found in table {table_id}",
+                HttpErrorCode.NOT_FOUND,
+                {
+                    "localization": {
+                        "i18nKey": "httpErrors.field.notFoundInTable",
+                        "context": {"tableId": table_id, "fieldId": field_id},
+                    }
+                },
+            )
+        count = await repository.count_data_rows(table["base_id"], table_id)
+        return {
+            "graph": self._delete_plan_graph(table_id, table["name"], field),
+            "updateCellCount": count,
+            "estimateTime": count // 3,
+        }
+
+    async def plan_convert(
+        self, table_id: str, field_id: str, body: FieldConvertBody
+    ) -> dict[str, Any]:
+        table = await self._load_table(table_id)
+        field = await repository.get_field_row(table_id, field_id)
+        if field is None:
+            raise _field_not_found(field_id)
+        count = await repository.count_non_null(table["base_id"], table_id, field["db_field_name"])
+        return {
+            "updateCellCount": count,
+            "estimateTime": count // 3,
+            "linkFieldCount": 0,
+        }
+
+    async def convert_field(
+        self, table_id: str, field_id: str, body: FieldConvertBody
+    ) -> dict[str, Any]:
+        table = await self._load_table(table_id)
+        field = await repository.get_field_row(table_id, field_id)
+        if field is None:
+            raise _field_not_found(field_id)
+
+        db_field_name = body.dbFieldName or field["db_field_name"]
+        if body.dbFieldName is not None and not _DB_FIELD_NAME_RE.match(body.dbFieldName):
+            raise _invalid_db_field_name()
+        updates: dict[str, Any] = {
+            "type": body.type,
+            "name": body.name or field["name"],
+            "db_field_name": db_field_name,
+            "cell_value_type": CELL_VALUE_TYPES[body.type],
+            "db_field_type": DB_FIELD_TYPES[body.type],
+            "is_multiple_cell_value": body.type in ("multipleSelect", "attachment", "user"),
+            "options": json.dumps(
+                _normalize_options(body.type, body.options), separators=(",", ":")
+            ),
+            "version": field["version"] + 1,
+            "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
+            "last_modified_by": cls.get("user.id"),
+        }
+        await repository.alter_field_column_type(
+            table["base_id"], table_id, db_field_name, ddl.FIELD_DB_TYPES[body.type]
+        )
+        field = await repository.update_field_row(field_id, updates) or field
+        return _field_vo(field)

@@ -69,3 +69,28 @@ async def count_data_rows(base_id: str, table_id: str) -> int:
     async with db_engine.session() as session:
         value = await session.execute(text(f'SELECT count(*) FROM "{base_id}"."{table_id}"'))
     return int(value.scalar() or 0)
+
+
+async def count_non_null(base_id: str, table_id: str, db_field_name: str) -> int:
+    async with db_engine.session() as session:
+        value = await session.execute(
+            text(
+                f'SELECT count(*) FROM "{base_id}"."{table_id}" '
+                f'WHERE "{db_field_name}" IS NOT NULL'
+            )
+        )
+    return int(value.scalar() or 0)
+
+
+async def alter_field_column_type(
+    base_id: str, table_id: str, db_field_name: str, column_type: str
+) -> None:
+    async with db_engine.session() as session:
+        await session.execute(
+            text(
+                f'ALTER TABLE "{base_id}"."{table_id}" '
+                f'ALTER COLUMN "{db_field_name}" TYPE {column_type} '
+                f'USING "{db_field_name}"::{column_type}'
+            )
+        )
+        await session.commit()

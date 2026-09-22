@@ -47,6 +47,16 @@ class FieldPatchBody(ZodModel):
         return trimmed
 
 
+class FieldConvertBody(ZodModel):
+    type: FieldTypeStr
+    name: str | None = None
+    description: ZodNullableStr = None
+    dbFieldName: str | None = None
+    unique: bool | None = None
+    notNull: bool | None = None
+    options: dict[str, Any] | None = None
+
+
 class DuplicateFieldBody(ZodModel):
     name: str
 
