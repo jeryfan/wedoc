@@ -121,7 +121,11 @@ class ClsMiddleware:
         headers = dict(scope.get("headers") or [])
         raw = headers.get(b"x-request-id")
         request_id = raw.decode() if raw else uuid.uuid4().hex
-        token = enter({"id": request_id})
+        initial: dict[str, Any] = {"id": request_id}
+        window_raw = headers.get(b"x-window-id")
+        if window_raw:
+            initial["windowId"] = window_raw.decode()
+        token = enter(initial)
         try:
             await self.app(scope, receive, send)
         finally:

@@ -79,9 +79,13 @@ def _storage_cipher_entries(settings: Settings) -> list[tuple[str, bytes, bytes]
 
 
 def storage_token_encryptor(settings: Settings | None = None) -> Encryptor:
-    """Encryptor over {expiresDate, respHeaders} tokens (local provider urls)."""
+    """Encryptor over {expiresDate, respHeaders} tokens (local provider urls).
+
+    Upstream ``Encryptor`` defaults to hex encoding; the local read token must
+    be hex so it survives URL query transport without +// escaping issues.
+    """
     entries = _storage_cipher_entries(settings or get_settings())
-    return _encryptor_class()(entries, encoding="base64")
+    return _encryptor_class()(entries, encoding="hex")
 
 
 class LocalStorage:

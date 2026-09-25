@@ -1,8 +1,8 @@
 """Routes for /api/table/:tableId/field.
 
-Ports field-open-api.controller.ts. convert + plan routes and the socket
-snapshot/doc-ids endpoints are deferred (see docs/api-parity-ledger.md);
-filter-link-records stays unimplemented until link fields land.
+Ports field-open-api.controller.ts. The socket snapshot/doc-ids endpoints
+(M3 realtime) are implemented here; filter-link-records stays unimplemented
+until link fields land (see docs/api-parity-ledger.md).
 """
 
 from typing import Any
@@ -21,10 +21,29 @@ router = APIRouter(
 )
 
 
+@router.get("/socket/snapshot-bulk", status_code=200)
+@permissions("field|read")
+async def socket_snapshot_bulk(tableId: str, request: Request) -> list[dict[str, Any]]:
+    ids = request.query_params.getlist("ids")
+    return await FieldService().socket_snapshot_bulk(tableId, ids)
+
+
+@router.get("/socket/doc-ids", status_code=200)
+@permissions("field|read")
+async def socket_doc_ids(tableId: str, request: Request) -> dict[str, Any]:
+    return await FieldService().socket_doc_ids(tableId, dict(request.query_params))
+
+
 @router.get("/delete-references", status_code=200)
 @permissions("field|delete")
 async def delete_references(tableId: str, request: Request) -> dict[str, Any]:
     return await FieldService().delete_references(tableId, request.query_params.getlist("fieldIds"))
+
+
+@router.get("/{fieldId}/filter-link-records", status_code=200)
+@permissions("field|update")
+async def filter_link_records(tableId: str, fieldId: str) -> list[dict[str, Any]]:
+    return await FieldService().get_filter_link_records(tableId, fieldId)
 
 
 @router.get("/{fieldId}", status_code=200)

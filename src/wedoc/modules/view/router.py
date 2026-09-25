@@ -1,8 +1,9 @@
 """Routes for /api/table/:tableId/view.
 
-Ports view-open-api.controller.ts. filter-link-records waits for link fields;
-the socket snapshot/doc-ids endpoints are M3 realtime; the plugin view
-endpoints need plugin infrastructure (deferred, see docs/api-parity-ledger.md).
+Ports view-open-api.controller.ts. The socket snapshot/doc-ids endpoints
+(M3 realtime) are implemented here; filter-link-records waits for link fields;
+the plugin view endpoints need plugin infrastructure (deferred, see
+docs/api-parity-ledger.md).
 """
 
 from typing import Any
@@ -12,6 +13,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from ...core.security.auth import auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
+from .plugin_service import ViewPluginService
 from .schemas import (
     ColumnMetaItem,
     ManualSortBody,
@@ -35,6 +37,25 @@ router = APIRouter(
 )
 
 
+@router.get("/socket/snapshot-bulk", status_code=200)
+@permissions("view|read")
+async def socket_snapshot_bulk(tableId: str, request: Request) -> list[dict[str, Any]]:
+    ids = request.query_params.getlist("ids")
+    return await ViewService().socket_snapshot_bulk(tableId, ids)
+
+
+@router.get("/socket/doc-ids", status_code=200)
+@permissions("view|read")
+async def socket_doc_ids(tableId: str, request: Request) -> dict[str, Any]:
+    return await ViewService().socket_doc_ids(tableId, dict(request.query_params))
+
+
+@router.get("/{viewId}/filter-link-records", status_code=200)
+@permissions("view|read")
+async def filter_link_records(tableId: str, viewId: str) -> list[dict[str, Any]]:
+    return await ViewService().get_filter_link_records(tableId, viewId)
+
+
 @router.get("/{viewId}", status_code=200)
 @permissions("view|read")
 async def get_view(tableId: str, viewId: str) -> dict[str, Any]:
@@ -52,6 +73,30 @@ async def list_views(tableId: str) -> list[dict[str, Any]]:
 async def create_view(tableId: str, request: Request) -> dict[str, Any]:
     body = ViewCreateBody.zod_validate(await read_json_body(request))
     return await ViewService().create_view(tableId, body)
+
+
+@router.post("/plugin", status_code=201)
+@permissions("view|create")
+async def install_view_plugin(tableId: str, request: Request) -> dict[str, Any]:
+    body = await read_json_body(request)
+    return await ViewPluginService().install(tableId, body)
+
+
+@router.get("/{viewId}/plugin", status_code=200)
+@permissions("view|read")
+async def get_view_plugin(tableId: str, viewId: str) -> dict[str, Any]:
+    return await ViewPluginService().get(tableId, viewId)
+
+
+@router.patch("/{viewId}/plugin/{pluginInstallId}", status_code=200)
+@permissions("view|update")
+async def update_view_plugin_storage(
+    tableId: str, viewId: str, pluginInstallId: str, request: Request
+) -> dict[str, Any]:
+    body = await read_json_body(request)
+    return await ViewPluginService().update_storage(
+        tableId, viewId, pluginInstallId, body.get("storage")
+    )
 
 
 @router.delete("/{viewId}", status_code=200)
@@ -113,7 +158,7 @@ async def update_group(tableId: str, viewId: str, request: Request) -> Response:
 @permissions("view|update")
 async def update_options(tableId: str, viewId: str, request: Request) -> Response:
     body = ViewOptionsBody.zod_validate(await read_json_body(request))
-    await ViewService().update_json_prop(tableId, viewId, "options", body.options)
+    await ViewService().update_options(tableId, viewId, body.options)
     return Response(status_code=200)
 
 
@@ -148,7 +193,9 @@ async def update_order(tableId: str, viewId: str, request: Request) -> Response:
 @permissions("view|update")
 async def update_record_order(tableId: str, viewId: str, request: Request) -> Response:
     body = RecordOrderBody.zod_validate(await read_json_body(request))
-    await ViewService().update_record_order(tableId, viewId, body.anchorId)
+    await ViewService().update_record_order(
+        tableId, viewId, body.anchorId, body.position, body.recordIds
+    )
     return Response(status_code=200)
 
 

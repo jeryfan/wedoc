@@ -43,12 +43,24 @@ def _now_ms() -> float:
 class CacheService:
     """Drop-in equivalent of the upstream CacheService (keyv facade)."""
 
+    # Session keys are also read by the separately-deployed frontend tier, whose
+    # @keyv/redis version stores the value under a `sets:namespace:{ns}:`-prefixed
+    # key. We mirror writes/deletes of these keys to that layout so a frontend on
+    # a different keyv version still resolves sessions wedoc issued. Reads stay on
+    # the plain key (wedoc's own writes).
+    _MIRROR_PREFIXES = ("auth:session-store:", "auth:session-user:")
+
     def __init__(self, redis: aioredis.Redis, namespace: str | None = None) -> None:
         self._redis = redis
         self.namespace = namespace if namespace is not None else cache_key_namespace()
 
     def physical_key(self, key: str) -> str:
         return f"{self.namespace}:{key}"
+
+    def _mirror_key(self, key: str) -> str | None:
+        if key.startswith(self._MIRROR_PREFIXES):
+            return f"sets:namespace:{self.namespace}:{self.namespace}:{key}"
+        return None
 
     async def get(self, key: str) -> Any | None:
         raw = await self._redis.get(self.physical_key(key))
@@ -96,13 +108,17 @@ class CacheService:
     async def _set_envelope(self, key: str, value: Any, ttl_seconds: int | None) -> None:
         expires = _now_ms() + ttl_seconds * 1000 if ttl_seconds else None
         payload = serialize_envelope(value, expires)
-        if ttl_seconds:
-            await self._redis.set(self.physical_key(key), payload, px=ttl_seconds * 1000)
-        else:
-            await self._redis.set(self.physical_key(key), payload)
+        px = ttl_seconds * 1000 if ttl_seconds else None
+        await self._redis.set(self.physical_key(key), payload, px=px)
+        mirror = self._mirror_key(key)
+        if mirror is not None:
+            await self._redis.set(mirror, payload, px=px)
 
     async def delete(self, key: str) -> bool:
         """True if the key existed, so callers can use it as an atomic consume."""
+        mirror = self._mirror_key(key)
+        if mirror is not None:
+            await self._redis.delete(mirror)
         return await self._redis.delete(self.physical_key(key)) > 0
 
     async def clear(self) -> None:
@@ -129,6 +145,9 @@ class CacheService:
     async def expire(self, key: str, ttl: int | str) -> bool:
         """Update Redis TTL only; safe for shortening envelope-carrying keys."""
         ttl_seconds = second(ttl) if isinstance(ttl, str) else ttl
+        mirror = self._mirror_key(key)
+        if mirror is not None:
+            await self._redis.expire(mirror, ttl_seconds)
         return bool(await self._redis.expire(self.physical_key(key), ttl_seconds))
 
     def _warn_not_set_ttl(self, key: str, ttl: int | None) -> None:

@@ -26,6 +26,7 @@ dependencies = [
     "boto3>=1.35",
     "arq>=0.26",
     "python-multipart>=0.0.32",
+    "pypinyin>=0.55.0",
 ]
 
 [dependency-groups]
@@ -43,6 +44,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 wedoc = "wedoc.main:run"
+wedoc-worker = "wedoc.workers.arq_app:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wedoc"]
@@ -57,3 +59,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# built-in-plugin copy stores upstream CJK marketing text verbatim for API parity,
+# so the ambiguous-unicode-in-string check would only flag intentional content.
+"src/wedoc/modules/plugin/builtin_seed.py" = ["RUF001"]

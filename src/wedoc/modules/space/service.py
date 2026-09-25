@@ -4,12 +4,14 @@ BYODB data-db routes and AI integration management are deliberately out of
 scope (single-PG deployment; see AGENTS.md), as is email invitation.
 """
 
+import json
 import re
 import time
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import select
 
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
@@ -113,6 +115,7 @@ class SpaceService:
 
     @staticmethod
     async def _create_default_ai_integration(space_id: str) -> None:
+        now = datetime.now(UTC).replace(tzinfo=None)
         async with db_engine.session() as session:
             await session.execute(
                 Integration.__table__.insert().values(
@@ -121,9 +124,166 @@ class SpaceService:
                     type="AI",
                     enable=False,
                     config='{"llmProviders":[]}',
+                    created_time=now,
+                    last_modified_time=now,
                 )
             )
             await session.commit()
+
+    # --- integration CRUD (ports space.service integration methods) ----------
+
+    @staticmethod
+    def _integration_vo(row: Any) -> dict[str, Any]:
+        vo: dict[str, Any] = {
+            "id": row.id,
+            "spaceId": row.resource_id,
+            "type": row.type,
+            "enable": bool(row.enable) if row.enable is not None else False,
+            "config": json.loads(row.config),
+            "createdTime": _iso(row.created_time),
+        }
+        if row.last_modified_time is not None:
+            vo["lastModifiedTime"] = _iso(row.last_modified_time)
+        return vo
+
+    @staticmethod
+    def _integration_row_vo(m: Any) -> dict[str, Any]:
+        # create/update echo the raw prisma row: resourceId + config as a string.
+        # Built from a `.returning()` mapping so it reflects the committed values
+        # (the ORM identity map is not refreshed with expire_on_commit=False).
+        enable = m["enable"]
+        return {
+            "id": m["id"],
+            "resourceId": m["resource_id"],
+            "config": m["config"],
+            "type": m["type"],
+            "enable": bool(enable) if enable is not None else None,
+            "createdTime": _iso(m["created_time"]),
+            "lastModifiedTime": _iso(m["last_modified_time"]),
+        }
+
+    async def get_integration_list(self, space_id: str) -> list[dict[str, Any]]:
+        async with db_engine.session() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(Integration).where(Integration.resource_id == space_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [self._integration_vo(row) for row in rows]
+
+    async def create_integration(self, space_id: str, ro: Any) -> dict[str, Any]:
+        from .ai_integration import dumps_config, normalize_space_ai_integration_config
+
+        config = ro.config or {}
+        now = datetime.now(UTC).replace(tzinfo=None)
+        async with db_engine.session() as session:
+            existing = (
+                await session.execute(
+                    select(Integration).where(
+                        Integration.resource_id == space_id, Integration.type == "AI"
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                next_config = normalize_space_ai_integration_config(config)
+                row_id = new_id(IdPrefix.INTEGRATION)
+                created = (
+                    (
+                        await session.execute(
+                            Integration.__table__.insert()
+                            .values(
+                                id=row_id,
+                                resource_id=space_id,
+                                type="AI",
+                                enable=ro.enable,
+                                config=dumps_config(next_config),
+                                created_time=now,
+                                last_modified_time=now,
+                            )
+                            .returning(Integration.__table__)
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                await session.commit()
+                return self._integration_row_vo(created)
+
+            original = json.loads(existing.config)
+            merged = {
+                **original,
+                **config,
+                "llmProviders": [
+                    *(original.get("llmProviders") or []),
+                    *(config.get("llmProviders") or []),
+                ],
+            }
+            next_config = normalize_space_ai_integration_config(merged)
+            updated = (
+                (
+                    await session.execute(
+                        Integration.__table__.update()
+                        .where(Integration.id == existing.id)
+                        .values(
+                            config=dumps_config(next_config),
+                            enable=ro.enable if ro.enable is not None else existing.enable,
+                            last_modified_time=now,
+                        )
+                        .returning(Integration.__table__)
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            await session.commit()
+            return self._integration_row_vo(updated)
+
+    async def update_integration(
+        self, integration_id: str, ro: Any, space_id: str
+    ) -> dict[str, Any]:
+        from .ai_integration import dumps_config, normalize_space_ai_integration_config
+
+        values: dict[str, Any] = {}
+        if ro.enable is not None:
+            values["enable"] = ro.enable
+        if ro.config is not None:
+            values["config"] = dumps_config(normalize_space_ai_integration_config(ro.config))
+        values["last_modified_time"] = datetime.now(UTC).replace(tzinfo=None)
+        async with db_engine.session() as session:
+            updated = (
+                (
+                    await session.execute(
+                        Integration.__table__.update()
+                        .where(Integration.id == integration_id)
+                        .values(**values)
+                        .returning(Integration.__table__)
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if updated is None:
+                raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
+            await session.commit()
+            return self._integration_row_vo(updated)
+
+    async def delete_integration(self, integration_id: str, space_id: str) -> None:
+        async with db_engine.session() as session:
+            result = await session.execute(
+                sa_delete(Integration).where(Integration.id == integration_id)
+            )
+            await session.commit()
+        if result.rowcount == 0:
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
+
+    async def test_integration_llm(self, ro: Any) -> dict[str, Any]:
+        from ..setting.service import SettingService
+
+        return await SettingService().test_llm(ro)
 
     async def get_space_by_id(self, space_id: str) -> dict[str, Any]:
         space = await repository.get_space_row(space_id)
@@ -229,8 +389,20 @@ class SpaceService:
     async def delete_space(self, space_id: str) -> None:
         if not await repository.soft_delete_space(space_id, cls.get("user.id")):
             raise _not_found()
+        from ..trash.listener import record_resource_deleted
+
+        space = await repository.get_space_row(space_id, include_deleted=True)
+        if space is not None:
+            await record_resource_deleted(
+                "space", space_id, None, space["deleted_time"]
+            )
 
     async def permanent_delete_space(self, space_id: str) -> dict[str, Any]:
+        from ...core.security.permissions import PermissionService
+
+        await PermissionService().valid_permissions(
+            space_id, ["space|delete"], cls.get("accessTokenId"), True
+        )
         space = await repository.get_space_row(space_id, include_deleted=True)
         if space is None:
             raise _not_found()

@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import field_validator
 
-from ...core.validation import ZodEnumStr, ZodModel, ZodNullableStr
+from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel, ZodNullableStr
 from ..space.schemas import (
     PRINCIPAL_TYPE_OPTIONS,
     ROLE_OPTIONS,
@@ -32,6 +32,45 @@ class UpdateBaseBody(ZodModel):
 class UpdateOrderBody(ZodModel):
     anchorId: str
     position: PositionStr
+
+
+class MoveBaseBody(ZodModel):
+    spaceId: str
+
+
+class DuplicateBaseBody(ZodModel):
+    fromBaseId: str
+    spaceId: str
+    withRecords: bool | None = None
+    name: str | None = None
+    baseId: str | None = None
+    nodes: list[str] | None = None
+    shareId: str | None = None
+    timeZone: str | None = None
+
+
+class CreateFromTemplateBody(ZodModel):
+    spaceId: str
+    templateId: str
+    withRecords: bool | None = None
+    baseId: str | None = None
+    timeZone: str | None = None
+
+
+class NotifyVo(ZodModel):
+    token: str
+    size: float
+    url: str
+    path: str
+    mimetype: str
+    width: float | None = None
+    height: float | None = None
+    presignedUrl: str
+
+
+class ImportBaseBody(ZodModel):
+    notify: NotifyVo
+    spaceId: str
 
 
 class AddBaseCollaboratorsBody(ZodModel):
@@ -118,3 +157,17 @@ class ListBaseCollaboratorUserQuery(ZodModel):
 
 class BaseInvitationLinkBody(ZodModel):
     role: BaseRoleStr
+
+
+class BaseEmailInvitationBody(ZodModel):
+    emails: list[ZodEmailStr]
+    role: BaseRoleStr
+
+
+class PublishBaseBody(ZodModel):
+    title: str
+    description: str
+    cover: dict[str, Any] | None = None
+    nodes: list[str] | None = None
+    includeData: bool | None = None
+    defaultActiveNodeId: str | None = None

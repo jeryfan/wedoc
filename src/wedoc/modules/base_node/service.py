@@ -4,9 +4,10 @@ plus folder/base-node-folder.service.ts.
 Node-level permission configuration (BaseNodePermissionGuard's permission
 context) is not ported: without any base_node_permission rows the upstream
 guard allows everything, which matches the single-PG deployment scope.
-Table/dashboard/workflow/app resource types are deferred with the table and
-dashboard modules; until then only folder resources exist and the node-list
-reconciliation maintains folder rows only.
+Folder, table and dashboard resource types are materialised as nodes; table
+resources reuse the table module's create/delete flow and dashboard resources
+the dashboard module's, exactly as the reference createResource/deleteResource
+switch does. Workflow/app resource types remain unsupported (invalid type).
 """
 
 from datetime import UTC, datetime
@@ -18,7 +19,7 @@ from ...core.ids import IdPrefix, new_id
 from ..space import repository as space_repository
 from ..space.service import get_uniq_name
 from . import repository
-from .schemas import RESOURCE_FOLDER
+from .schemas import DASHBOARD, RESOURCE_FOLDER, TABLE
 
 MAX_FOLDER_DEPTH = 2
 
@@ -51,17 +52,25 @@ class BaseNodeService:
     # -- VO assembly -----------------------------------------------------------
 
     @staticmethod
-    def _default_url(base_id: str, resource_type: str, resource_id: str) -> str:
+    def _default_url(
+        base_id: str,
+        resource_type: str,
+        resource_id: str,
+        default_view_id: str | None = None,
+    ) -> str:
         if resource_type == RESOURCE_FOLDER:
             return f"/base/{base_id}"
-        if resource_type == "dashboard":
+        if resource_type == TABLE:
+            if default_view_id:
+                return f"/base/{base_id}/table/{resource_id}/{default_view_id}"
+            return f"/base/{base_id}/table/{resource_id}"
+        if resource_type == DASHBOARD:
             return f"/base/{base_id}/dashboard/{resource_id}"
         if resource_type == "workflow":
             return f"/base/{base_id}/automation/{resource_id}"
         if resource_type == "app":
             return f"/base/{base_id}/app/{resource_id}"
-        # table without a resolved default view
-        return f"/base/{base_id}/table/{resource_id}"
+        return f"/base/{base_id}"
 
     async def _user_map(self, user_ids: list[str | None]) -> dict[str, dict[str, Any]]:
         ids = list({uid for uid in user_ids if uid})
@@ -85,13 +94,16 @@ class BaseNodeService:
                 return None
             return user_map.get(user_id) or None
 
-        resource_meta: dict[str, Any] = {
-            "name": resource.get("name"),
-        }
-        if resource.get("icon") is not None:
+        # Mirror the reference destructure-and-spread: the resource carries only
+        # the meta keys the resolver exposed, so icon (table list path, null-able)
+        # and defaultViewId (table create path) are emitted iff the resolver put
+        # them on the resource — never both at once.
+        resource_meta: dict[str, Any] = {"name": resource.get("name")}
+        if "icon" in resource:
             resource_meta["icon"] = resource["icon"]
-        if resource.get("default_view_id"):
-            resource_meta["defaultViewId"] = resource["default_view_id"]
+        default_view_id = resource.get("default_view_id")
+        if default_view_id is not None:
+            resource_meta["defaultViewId"] = default_view_id
         resource_meta["createdTime"] = _iso(resource.get("created_time"))
         resource_meta["createdByUser"] = resolve_user(resource.get("created_by"))
         resource_meta["lastModifiedTime"] = _iso(resource.get("last_modified_time"))
@@ -107,7 +119,9 @@ class BaseNodeService:
             "parent": {"id": entry["parent_id"]} if entry["parent_id"] else None,
             "children": children,
             "resourceMeta": resource_meta,
-            "defaultUrl": self._default_url(entry["base_id"], resource_type, entry["resource_id"]),
+            "defaultUrl": self._default_url(
+                entry["base_id"], resource_type, entry["resource_id"], default_view_id
+            ),
         }
 
     async def _vo(
@@ -136,6 +150,16 @@ class BaseNodeService:
             if not folders:
                 raise _not_found(resource_id)
             return folders[0]
+        if resource_type == TABLE:
+            tables = await repository.list_table_resource_rows(base_id, [resource_id])
+            if not tables:
+                raise _not_found(resource_id)
+            return tables[0]
+        if resource_type == DASHBOARD:
+            dashboards = await repository.list_dashboard_resource_rows(base_id, [resource_id])
+            if not dashboards:
+                raise _not_found(resource_id)
+            return dashboards[0]
         raise _invalid_resource_type(resource_type)
 
     # -- reads -------------------------------------------------------------------
@@ -153,10 +177,20 @@ class BaseNodeService:
         return await self._vo(entry)
 
     async def _prepare_node_list(self, base_id: str) -> list[dict[str, Any]]:
-        resources = [
-            {**folder, "type": RESOURCE_FOLDER}
-            for folder in await repository.list_folder_rows(base_id)
-        ]
+        resources = (
+            [
+                {**folder, "type": RESOURCE_FOLDER}
+                for folder in await repository.list_folder_rows(base_id)
+            ]
+            + [
+                {**table, "type": TABLE}
+                for table in await repository.list_table_resource_rows(base_id)
+            ]
+            + [
+                {**dashboard, "type": DASHBOARD}
+                for dashboard in await repository.list_dashboard_resource_rows(base_id)
+            ]
+        )
         user_map = await self._user_map(
             [r.get("created_by") for r in resources]
             + [r.get("last_modified_by") for r in resources]
@@ -241,27 +275,51 @@ class BaseNodeService:
         if parent_node and resource_type == RESOURCE_FOLDER:
             await self._assert_folder_depth(base_id, parent_node["id"])
 
-        if resource_type != RESOURCE_FOLDER:
-            raise _invalid_resource_type(resource_type)
-        folder = await self._create_folder_resource(base_id, body.name)
-        # createResource returns {id, name} only — the VO audit fields stay null.
-        resource = {"id": folder["id"], "name": folder["name"]}
+        resource = await self._create_resource(base_id, resource_type, body)
         # placement parents the node under the resolved parent node, not the
         # raw (possibly resource) id from the request body.
         placement_parent = parent_node["id"] if parent_node else None
+        user_id = cls.get("user.id")
         max_order = await repository.get_max_order(base_id)
-        entry = await repository.insert_node(
-            {
-                "id": new_id(IdPrefix.BASE_NODE),
-                "base_id": base_id,
-                "resource_type": resource_type,
-                "resource_id": resource["id"],
-                "order": max_order + 1,
-                "parent_id": placement_parent,
-                "created_by": cls.get("user.id"),
-            }
+        placement = {"order": max_order + 1, "parent_id": placement_parent}
+        # upsert: a concurrent node-list reconciliation may already hold a
+        # root-level row for a resource created out of band.
+        entry = await repository.upsert_node(
+            base_id,
+            resource_type,
+            resource["id"],
+            {"id": new_id(IdPrefix.BASE_NODE), "created_by": user_id, **placement},
+            {"last_modified_by": user_id, **placement},
         )
         return await self._vo(entry, resource)
+
+    async def _create_resource(
+        self, base_id: str, resource_type: str, body: Any
+    ) -> dict[str, Any]:
+        if resource_type == RESOURCE_FOLDER:
+            folder = await self._create_folder_resource(base_id, body.name)
+            # createResource returns {id, name} only — the VO audit fields stay null.
+            return {"id": folder["id"], "name": folder["name"]}
+        if resource_type == TABLE:
+            from ..table.service import TableService
+
+            table = await TableService().create_table(base_id, body)
+            # create path carries defaultViewId (no icon) — the reference returns
+            # table.icon as undefined here, so the VO omits icon on create.
+            return {
+                "id": table["id"],
+                "name": table["name"],
+                "default_view_id": table["defaultViewId"],
+            }
+        if resource_type == DASHBOARD:
+            from ..dashboard.schemas import CreateDashboardRo
+            from ..dashboard.service import DashboardService
+
+            dashboard = await DashboardService().create_dashboard(
+                base_id, CreateDashboardRo(name=body.name)
+            )
+            return {"id": dashboard["id"], "name": dashboard["name"]}
+        raise _invalid_resource_type(resource_type)
 
     async def _create_folder_resource(self, base_id: str, name: str) -> dict[str, Any]:
         names = await repository.list_folder_names(base_id)
@@ -281,13 +339,67 @@ class BaseNodeService:
         anchor = await repository.get_node_row(node_id)
         if anchor is None or anchor["base_id"] != base_id:
             raise _not_found(node_id)
-        if anchor["resource_type"] == RESOURCE_FOLDER:
+        resource_type = anchor["resource_type"]
+        if resource_type == RESOURCE_FOLDER:
             raise ApiError(
                 "Cannot duplicate folder",
                 HttpErrorCode.VALIDATION_ERROR,
                 {"localization": {"i18nKey": "httpErrors.baseNode.cannotDuplicateFolder"}},
             )
-        raise _invalid_resource_type(anchor["resource_type"])
+        resource = await self._duplicate_resource(
+            base_id, resource_type, anchor["resource_id"], body
+        )
+        user_id = cls.get("user.id")
+        # placement mirrors the anchor's parent; the node is inserted at the tail
+        # then re-ordered to sit immediately after the anchor (updateOrder 'after').
+        max_order = await repository.get_max_order(base_id, anchor["parent_id"])
+        placement = {"order": max_order + 1, "parent_id": anchor["parent_id"]}
+        entry = await repository.upsert_node(
+            base_id,
+            resource_type,
+            resource["id"],
+            {"id": new_id(IdPrefix.BASE_NODE), "created_by": user_id, **placement},
+            {"last_modified_by": user_id, **placement},
+        )
+        new_order = await self._compute_order(
+            base_id, entry, anchor, "after", exclude_id=entry["id"]
+        )
+        if new_order != entry["order"]:
+            # Persist the fractional "after anchor" order so the node tree reflects
+            # it, but return the VO from the pre-reorder entry: the reference reuses
+            # its stale upsert result (order = maxOrder+1) for the response body.
+            await repository.update_node_row(
+                entry["id"], {"order": new_order, "last_modified_by": user_id}
+            )
+        return await self._vo(entry, resource)
+
+    async def _duplicate_resource(
+        self, base_id: str, resource_type: str, resource_id: str, body: Any
+    ) -> dict[str, Any]:
+        data = body if isinstance(body, dict) else {}
+        if resource_type == TABLE:
+            from ..table.service import TableService
+
+            table = await TableService().duplicate_table(
+                base_id,
+                resource_id,
+                data.get("name"),
+                bool(data.get("includeRecords")),
+            )
+            return {
+                "id": table["id"],
+                "name": table["name"],
+                "default_view_id": table.get("defaultViewId"),
+            }
+        if resource_type == DASHBOARD:
+            from ..dashboard.schemas import DuplicateDashboardRo
+            from ..dashboard.service import DashboardService
+
+            dashboard = await DashboardService().duplicate_dashboard(
+                base_id, resource_id, DuplicateDashboardRo(name=data.get("name"))
+            )
+            return {"id": dashboard["id"], "name": dashboard["name"]}
+        raise _invalid_resource_type(resource_type)
 
     async def update(self, base_id: str, node_id: str, body: Any) -> dict[str, Any]:
         entry = await repository.get_node_row(node_id)
@@ -374,10 +486,15 @@ class BaseNodeService:
         return updated
 
     async def _compute_order(
-        self, base_id: str, node: dict[str, Any], anchor: dict[str, Any], position: str
+        self,
+        base_id: str,
+        node: dict[str, Any],
+        anchor: dict[str, Any],
+        position: str,
+        exclude_id: str | None = None,
     ) -> float:
         before = position == "before"
-        neighbor = await self._next_node(base_id, anchor, below=before, exclude_id=None)
+        neighbor = await self._next_node(base_id, anchor, below=before, exclude_id=exclude_id)
         if neighbor is None:
             return anchor["order"] + (-1 if before else 1)
         order = (neighbor["order"] + anchor["order"]) / 2
@@ -385,7 +502,7 @@ class BaseNodeService:
             await self._shuffle_orders(base_id, anchor["parent_id"])
             anchor = await repository.get_node_row(anchor["id"])
             assert anchor is not None
-            return await self._compute_order(base_id, node, anchor, position)
+            return await self._compute_order(base_id, node, anchor, position, exclude_id)
         return order
 
     async def _next_node(
@@ -450,7 +567,8 @@ class BaseNodeService:
         node = await repository.get_node_row(node_id)
         if node is None or node["base_id"] != base_id:
             raise _not_found(node_id)
-        if node["resource_type"] == RESOURCE_FOLDER:
+        resource_type = node["resource_type"]
+        if resource_type == RESOURCE_FOLDER:
             children = [
                 n for n in await repository.list_node_rows(base_id) if n["parent_id"] == node_id
             ]
@@ -460,15 +578,64 @@ class BaseNodeService:
                     HttpErrorCode.VALIDATION_ERROR,
                     {"localization": {"i18nKey": "httpErrors.baseNode.cannotDeleteEmptyFolder"}},
                 )
-        if node["resource_type"] != RESOURCE_FOLDER:
-            raise _invalid_resource_type(node["resource_type"])
-        await repository.delete_folder_row(base_id, node["resource_id"])
+            await repository.delete_folder_row(base_id, node["resource_id"])
+        elif resource_type == TABLE:
+            from ..table.service import TableService
+
+            if permanent:
+                await TableService().permanent_delete_table(base_id, node["resource_id"])
+            else:
+                await TableService().delete_table(base_id, node["resource_id"])
+        elif resource_type == DASHBOARD:
+            from ..dashboard.service import DashboardService
+
+            await DashboardService().delete_dashboard(base_id, node["resource_id"])
+        else:
+            raise _invalid_resource_type(resource_type)
         await repository.delete_node_row(node_id)
-        return {"resourceType": node["resource_type"], "resourceId": node["resource_id"]}
+        return {"resourceType": resource_type, "resourceId": node["resource_id"]}
 
-    # -- folder depth ------------------------------------------------------------
+    # -- placement for out-of-band resources (import, table open-api) -------------
 
-    async def _get_parent_node(self, base_id: str, node_id: str) -> dict[str, Any]:
+    async def resolve_folder_node_id(self, base_id: str, folder_id: str) -> str:
+        """Resolve a folder reference — its node id or its folder resource id — to
+        the node id, asserting it is a folder in this base."""
+        node = await self._find_node_by_id_or_resource(base_id, folder_id)
+        if node is None:
+            raise ApiError(
+                f"Parent {folder_id} not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.baseNode.parentNotFound"}},
+            )
+        if node["resource_type"] != RESOURCE_FOLDER:
+            raise ApiError(
+                f"Parent {folder_id} is not a folder",
+                HttpErrorCode.VALIDATION_ERROR,
+                {"localization": {"i18nKey": "httpErrors.baseNode.parentIsNotFolder"}},
+            )
+        return node["id"]
+
+    async def attach_resource_to_parent(
+        self, base_id: str, parent_id: str | None, resource_type: str, resource_id: str
+    ) -> None:
+        """Place a resource created outside the base-node flow under a folder, or
+        at root when parentId is null; callers validate the folder first. Upserts
+        because node-list reconciliation may have already created the row."""
+        user_id = cls.get("user.id")
+        max_order = await repository.get_max_order(base_id)
+        placement = {"order": max_order + 1, "parent_id": parent_id}
+        await repository.upsert_node(
+            base_id,
+            resource_type,
+            resource_id,
+            {"id": new_id(IdPrefix.BASE_NODE), "created_by": user_id, **placement},
+            {"last_modified_by": user_id, **placement},
+        )
+
+    @staticmethod
+    async def _find_node_by_id_or_resource(
+        base_id: str, ref_id: str
+    ) -> dict[str, Any] | None:
         from sqlalchemy import or_, select
 
         from ...db import engine as db_engine
@@ -481,8 +648,8 @@ class BaseNodeService:
                         select(BaseNodeModel).where(
                             BaseNodeModel.base_id == base_id,
                             or_(
-                                BaseNodeModel.id == node_id,
-                                BaseNodeModel.resource_id == node_id,
+                                BaseNodeModel.id == ref_id,
+                                BaseNodeModel.resource_id == ref_id,
                             ),
                         )
                     )
@@ -491,12 +658,20 @@ class BaseNodeService:
                 .first()
             )
         if row is None:
+            return None
+        return {c.name: getattr(row, c.name) for c in BaseNodeModel.__table__.columns}
+
+    # -- folder depth ------------------------------------------------------------
+
+    async def _get_parent_node(self, base_id: str, node_id: str) -> dict[str, Any]:
+        node = await self._find_node_by_id_or_resource(base_id, node_id)
+        if node is None:
             raise ApiError(
                 "Base node not found",
                 HttpErrorCode.NOT_FOUND,
                 {"localization": {"i18nKey": "httpErrors.baseNode.notFound"}},
             )
-        return {c.name: getattr(row, c.name) for c in BaseNodeModel.__table__.columns}
+        return node
 
     async def _assert_folder_depth(self, base_id: str, folder_id: str) -> None:
         if await self._folder_depth(base_id, folder_id) >= MAX_FOLDER_DEPTH:

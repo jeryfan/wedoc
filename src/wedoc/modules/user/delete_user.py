@@ -34,6 +34,12 @@ def _now() -> datetime:
     return datetime.now(tz=UTC).replace(tzinfo=None)
 
 
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        return dt.isoformat(timespec="milliseconds") + "Z"
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 class DeleteUserService:
     async def _validate_delete_user(self, user_id: str) -> None:
         async with db_engine.session() as session:
@@ -65,11 +71,7 @@ class DeleteUserService:
                         {
                             "id": row[0],
                             "name": row[1],
-                            "deletedTime": (
-                                row[2].isoformat(timespec="milliseconds").replace("+00:00", "Z")
-                                if row[2]
-                                else None
-                            ),
+                            "deletedTime": _iso(row[2]) if row[2] else None,
                         }
                         for row in rows
                     ],

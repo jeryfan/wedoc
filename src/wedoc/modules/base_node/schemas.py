@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import field_validator
 
 from ...core.validation import ZodEnumStr, ZodModel, ZodNullableStr
+from ..table.schemas import FieldKeyTypeStr, FieldRoBody, RecordRoBody, ViewRoBody
 
 RESOURCE_FOLDER = "folder"
 TABLE = "table"
@@ -37,6 +38,38 @@ class CreateNodeBody(ZodModel):
     @classmethod
     def _name(cls, v: Any) -> Any:
         return _required_name(v)
+
+
+class CreateTableNodeBody(ZodModel):
+    """resourceType=table branch: base-node fields spread with the table RO
+    (tableRoWithDefaultSchema). name is optional here (the table default applies)."""
+
+    resourceType: ResourceTypeStr
+    parentId: ZodNullableStr = None
+    name: str | None = None
+    description: ZodNullableStr = None
+    icon: ZodNullableStr = None
+    dbTableName: str | None = None
+    fieldKeyType: FieldKeyTypeStr = "name"
+    fields: list[FieldRoBody] | None = None
+    views: list[ViewRoBody] | None = None
+    records: list[RecordRoBody] | None = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _name(cls, v: Any) -> Any:
+        if v is None:
+            return v
+        return _required_name(v)
+
+
+class CreateDashboardNodeBody(ZodModel):
+    """resourceType=dashboard branch: base-node fields spread with createDashboardRoSchema
+    (name is z.string(), no trim/min)."""
+
+    resourceType: ResourceTypeStr
+    parentId: ZodNullableStr = None
+    name: str
 
 
 class UpdateNodeBody(ZodModel):

@@ -24,6 +24,9 @@ FieldTypeStr = ZodEnumStr(
         "lastModifiedBy",
         "user",
         "button",
+        "link",
+        "rollup",
+        "formula",
     ]
 )
 ViewTypeStr = ZodEnumStr(["grid", "kanban", "form", "calendar", "gallery"])
@@ -143,3 +146,16 @@ class UpdateOrderBody(ZodModel):
 class DuplicateTableBody(ZodModel):
     name: str
     includeRecords: bool
+
+
+class ToggleIndexBody(ZodModel):
+    type: str
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _type(cls, v: Any) -> Any:
+        # z.enum(TableIndex) with the single member "search" reports this literal
+        # message on any other value.
+        if v != "search":
+            raise ValueError('Invalid input: expected "search"')
+        return v

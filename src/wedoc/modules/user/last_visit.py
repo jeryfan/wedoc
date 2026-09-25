@@ -26,6 +26,8 @@ from . import repository
 
 
 def _iso(dt: Any) -> str:
+    if dt.tzinfo is None:
+        return dt.isoformat(timespec="milliseconds") + "Z"
     return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 

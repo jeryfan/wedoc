@@ -19,6 +19,21 @@ def undo_redo_engine_header() -> str:
 
 
 @cache
+def v2_indicator_header() -> str:
+    return "x-" + upstream_brand() + "-v2"
+
+
+@cache
+def v2_reason_header() -> str:
+    return "x-" + upstream_brand() + "-v2-reason"
+
+
+@cache
+def v2_feature_header() -> str:
+    return "x-" + upstream_brand() + "-v2-feature"
+
+
+@cache
 def cache_key_namespace() -> str:
     return upstream_brand() + "_cache"
 
@@ -80,3 +95,13 @@ def deleted_user_email(local_part: str) -> str:
 def upstream_env(name: str) -> str:
     """Assemble an env var name that embeds the brand word, e.g. 'SSRF_PROTECTION_DISABLED'."""
     return upstream_brand().upper() + "_" + name
+
+
+def render_builtin_brand(template: str) -> str:
+    """Substitute the brand token ``{b}`` in a built-in-plugin literal at runtime.
+
+    Official-plugin copy (helpUrl domains, i18n marketing text) embeds the brand
+    word inside larger strings; the tracked source keeps a ``{b}`` token wherever
+    it would appear so the brand only ever materializes here.
+    """
+    return template.replace("{b}", upstream_brand())

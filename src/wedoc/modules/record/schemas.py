@@ -38,3 +38,8 @@ class RecordSubmitBody(ZodModel):
     viewId: str
     fields: dict[str, Any]
     typecast: bool | None = None
+
+
+class InsertAttachmentBody(ZodModel):
+    attachments: list[dict[str, Any]]
+    anchorId: str | None = None

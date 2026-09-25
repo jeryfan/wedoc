@@ -273,6 +273,22 @@ async def insert_data_rows(
         await session.commit()
 
 
+async def fetch_data_row_meta(
+    base_id: str, table_id: str, record_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    """System-column metadata keyed by ``__id`` for freshly inserted rows."""
+    if not record_ids:
+        return {}
+    sql = (
+        'SELECT "__id", "__auto_number", "__created_time", "__last_modified_time", '
+        '"__created_by", "__last_modified_by" '
+        f'FROM "{base_id}"."{table_id}" WHERE "__id" = ANY(:ids)'
+    )
+    async with db_engine.session() as session:
+        rows = (await session.execute(text(sql), {"ids": record_ids})).mappings().all()
+    return {r["__id"]: dict(r) for r in rows}
+
+
 async def max_field_order(table_id: str) -> float:
     async with db_engine.session() as session:
         value = (

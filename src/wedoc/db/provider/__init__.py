@@ -28,8 +28,30 @@ def drop_schema_sql(schema_name: str) -> str:
 # ---- per-table physical DDL (ports db-provider postgres table utils) ---------
 
 
+def _transliterate(name: str) -> str:
+    """Romanise non-ASCII (CJK) to capitalized, space-joined syllables.
+
+    Mirrors the upstream `transliteration` slugify pre-step so `单行文本`
+    becomes `Dan Xing Wen Ben` before slug cleanup (yielding
+    `Dan_Xing_Wen_Ben` instead of the old `unnamed` reduction).
+    """
+    from pypinyin import lazy_pinyin
+
+    result: list[str] = []
+    for ch in name:
+        if ch.isascii():
+            result.append(ch)
+            continue
+        syllables = lazy_pinyin(ch)
+        roman = "".join(s.capitalize() for s in syllables if s and s.isascii())
+        if roman:
+            result.append(" " + roman + " ")
+    return "".join(result)
+
+
 def convert_name_to_valid_character(name: str, max_length: int = 10) -> str:
     """ports utils/name-conversion.ts: slugify keeping [a-zA-Z0-9_], '_' separator."""
+    name = _transliterate(name)
     out: list[str] = []
     prev_sep = False
     prev_lower_or_digit = False
@@ -98,9 +120,24 @@ FIELD_DB_TYPES: dict[str, str] = {
     "autoNumber": "double precision",
     "createdTime": "timestamptz",
     "lastModifiedTime": "timestamptz",
+    "createdBy": "text",
+    "lastModifiedBy": "text",
     "user": "jsonb",
     "attachment": "jsonb",
     "button": "text",
+    "link": "jsonb",
+}
+
+# db field type (upstream DbFieldType) -> physical column type, used for the
+# base column of computed fields (lookup/rollup) whose db type is derived.
+DB_FIELD_TYPE_TO_COLUMN = {
+    "TEXT": "text",
+    "INTEGER": "integer",
+    "REAL": "double precision",
+    "BOOLEAN": "boolean",
+    "DATETIME": "timestamptz",
+    "JSON": "jsonb",
+    "BLOB": "bytea",
 }
 
 
@@ -112,3 +149,39 @@ def add_field_column_sql(
         f"ALTER TABLE {_qualified(schema_name, table_name)} "
         f"ADD COLUMN {_quoted_identifier(db_field_name)} {column_type} NULL"
     )
+
+
+def add_column_by_db_type_sql(
+    schema_name: str, table_name: str, db_field_name: str, db_field_type: str
+) -> str:
+    """ADD COLUMN using an upstream DbFieldType (for lookup/rollup base cols)."""
+    column_type = DB_FIELD_TYPE_TO_COLUMN[db_field_type]
+    return (
+        f"ALTER TABLE {_qualified(schema_name, table_name)} "
+        f"ADD COLUMN {_quoted_identifier(db_field_name)} {column_type} NULL"
+    )
+
+
+from .link import (  # noqa: E402
+    foreign_key_name,
+    junction_table_name,
+    link_relation_ddl,
+    link_relation_teardown_ddl,
+    parse_db_table_name,
+)
+
+__all__ = [
+    "add_column_by_db_type_sql",
+    "add_field_column_sql",
+    "convert_name_to_valid_character",
+    "create_data_table_sql",
+    "create_schema_sql",
+    "drop_data_table_sql",
+    "drop_schema_sql",
+    "foreign_key_name",
+    "junction_table_name",
+    "link_relation_ddl",
+    "link_relation_teardown_ddl",
+    "parse_db_table_name",
+    "rename_data_table_sql",
+]

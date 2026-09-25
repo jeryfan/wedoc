@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import select, text
 
+from ...core import cls
 from ...db import engine as db_engine
 from ...db.models_meta import User
 
@@ -68,6 +69,31 @@ async def count_rows(
     return int(value.scalar() or 0)
 
 
+async def distinct_column_values(
+    base_id: str, table_id: str, column: str
+) -> list[Any]:
+    """Distinct non-null values of a physical column (for record collaborators)."""
+    sql = f'SELECT DISTINCT "{column}" FROM {_q(base_id, table_id)} WHERE "{column}" IS NOT NULL'
+    async with db_engine.session() as session:
+        rows = (await session.execute(text(sql))).all()
+    return [r[0] for r in rows]
+
+
+async def fetch_column_by_ids(
+    base_id: str, table_id: str, column: str, ids: list[str]
+) -> dict[str, Any]:
+    """Map ``__id -> column`` for the given record ids (computed-field resolution)."""
+    if not ids:
+        return {}
+    sql = (
+        f'SELECT "__id" AS id, "{column}" AS value FROM {_q(base_id, table_id)} '
+        'WHERE "__id" = ANY(:ids)'
+    )
+    async with db_engine.session() as session:
+        rows = (await session.execute(text(sql), {"ids": ids})).mappings().all()
+    return {r["id"]: r["value"] for r in rows}
+
+
 async def insert_row(base_id: str, table_id: str, values: dict[str, Any]) -> None:
     cols = ", ".join(f'"{c}"' for c in values)
     names = ", ".join(f":v{i}" for i in range(len(values)))
@@ -81,9 +107,11 @@ async def update_row(base_id: str, table_id: str, record_id: str, values: dict[s
     sets = ", ".join(f'"{c}" = :s{i}' for i, c in enumerate(values))
     bind = {f"s{i}": v for i, v in enumerate(values.values())}
     bind["rid"] = record_id
+    bind["lmb"] = cls.get("user.id")
     sql = (
         f"UPDATE {_q(base_id, table_id)} SET {sets}, "
-        '"__version" = "__version" + 1, "__last_modified_time" = now() '
+        '"__version" = "__version" + 1, "__last_modified_time" = now(), '
+        '"__last_modified_by" = :lmb '
         "WHERE __id = :rid"
     )
     async with db_engine.session() as session:
@@ -98,6 +126,125 @@ async def delete_row(base_id: str, table_id: str, record_id: str) -> None:
             {"rid": record_id},
         )
         await session.commit()
+
+
+async def column_exists(base_id: str, table_id: str, column: str) -> bool:
+    sql = (
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = :s AND table_name = :t AND column_name = :c"
+    )
+    async with db_engine.session() as session:
+        value = await session.execute(
+            text(sql), {"s": base_id, "t": table_id, "c": column}
+        )
+    return value.first() is not None
+
+
+async def ensure_view_order_column(base_id: str, table_id: str, column: str) -> None:
+    """Lazily create a per-view row-order column, seeded from ``__auto_number``.
+
+    Mirrors the reference row-index column (``__row_{viewId}``): a view without
+    it orders by ``__auto_number``; once manual reorder happens the column is
+    created and becomes the view's order.
+    """
+    if await column_exists(base_id, table_id, column):
+        return
+    table = _q(base_id, table_id)
+    index_name = f"idx_{column}"[:63]
+    async with db_engine.session() as session:
+        await session.execute(
+            text(f'ALTER TABLE {table} ADD COLUMN "{column}" double precision')
+        )
+        await session.execute(text(f'UPDATE {table} SET "{column}" = "__auto_number"'))
+        await session.execute(
+            text(f'CREATE INDEX IF NOT EXISTS "{index_name}" ON {table} ("{column}")')
+        )
+        await session.commit()
+
+
+async def get_column_value(base_id: str, table_id: str, column: str, record_id: str) -> Any:
+    sql = f'SELECT "{column}" AS v FROM {_q(base_id, table_id)} WHERE "__id" = :rid'
+    async with db_engine.session() as session:
+        value = await session.execute(text(sql), {"rid": record_id})
+    row = value.first()
+    return row[0] if row else None
+
+
+async def neighbor_order_value(
+    base_id: str, table_id: str, column: str, anchor_value: float, below: bool, exclude: list[str]
+) -> float | None:
+    """Order value of the row immediately beyond ``anchor_value`` on one side,
+    skipping the records being moved (``exclude``)."""
+    op = ">" if below else "<"
+    direction = "ASC" if below else "DESC"
+    sql = (
+        f'SELECT "{column}" AS v FROM {_q(base_id, table_id)} '
+        f'WHERE "{column}" {op} :anchor AND NOT ("__id" = ANY(:exclude)) '
+        f'ORDER BY "{column}" {direction} LIMIT 1'
+    )
+    async with db_engine.session() as session:
+        value = await session.execute(
+            text(sql), {"anchor": anchor_value, "exclude": exclude or [""]}
+        )
+    row = value.first()
+    return row[0] if row else None
+
+
+async def set_column_values(
+    base_id: str, table_id: str, column: str, values: dict[str, float]
+) -> None:
+    if not values:
+        return
+    sql = f'UPDATE {_q(base_id, table_id)} SET "{column}" = :val WHERE "__id" = :rid'
+    async with db_engine.session() as session:
+        for record_id, order in values.items():
+            await session.execute(text(sql), {"val": order, "rid": record_id})
+        await session.commit()
+
+
+async def set_computed_columns(
+    base_id: str, table_id: str, record_id: str, values: dict[str, Any]
+) -> None:
+    """Write materialized computed (formula/lookup/rollup) columns for a record.
+
+    Unlike ``update_row`` this touches no system columns: the value is derived,
+    not a user edit, so it must not bump ``__version``/``__last_modified_*``.
+    """
+    if not values:
+        return
+    sets = ", ".join(f'"{c}" = :s{i}' for i, c in enumerate(values))
+    bind: dict[str, Any] = {f"s{i}": v for i, v in enumerate(values.values())}
+    bind["rid"] = record_id
+    sql = f"UPDATE {_q(base_id, table_id)} SET {sets} WHERE __id = :rid"
+    async with db_engine.session() as session:
+        await session.execute(text(sql), bind)
+        await session.commit()
+
+
+async def list_ids_linking_to(
+    base_id: str, table_id: str, link_column: str, foreign_ids: list[str], is_multiple: bool
+) -> list[str]:
+    """Record ids whose denormalized link cell references any of ``foreign_ids``.
+
+    Reads the same ``{id,title}`` / ``[{id,title}]`` cell the read path aggregates
+    from, so dependent lookup/rollup recomputation stays consistent with reads.
+    """
+    if not foreign_ids:
+        return []
+    col = f'"{link_column}"'
+    if is_multiple:
+        predicate = (
+            f"jsonb_exists_any(jsonb_path_query_array({col}::jsonb, '$[*].id'), :fids)"
+        )
+    else:
+        predicate = f"({col}::jsonb ->> 'id') = ANY(:fids)"
+    sql = (
+        f'SELECT "__id" AS id FROM {_q(base_id, table_id)} '
+        f"WHERE {col} IS NOT NULL AND {predicate}"
+    )
+    async with db_engine.session() as session:
+        rows = (await session.execute(text(sql), {"fids": list(foreign_ids)})).mappings().all()
+    return [r["id"] for r in rows]
 
 
 # ---- record history (meta schema) --------------------------------------------

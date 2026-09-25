@@ -21,9 +21,15 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 async def init_db() -> None:
     global _meta_engine, _meta_pool, _session_factory
     settings = get_settings()
-    _meta_engine = create_async_engine(settings.sqlalchemy_dsn, pool_size=20)
+    _meta_engine = create_async_engine(
+        settings.sqlalchemy_dsn,
+        pool_size=20,
+        connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
+    )
     _session_factory = async_sessionmaker(_meta_engine, expire_on_commit=False)
-    _meta_pool = await asyncpg.create_pool(settings.meta_database_dsn, min_size=2, max_size=20)
+    _meta_pool = await asyncpg.create_pool(
+        settings.meta_database_dsn, min_size=2, max_size=20, statement_cache_size=0
+    )
 
 
 async def close_db() -> None:

@@ -436,7 +436,7 @@ class _AccessTokenValidator:
                 await session.execute(
                     self._access_tokens.update()
                     .where(self._access_tokens.c.id == access_token_id)
-                    .values(last_used_time=datetime.now(tz=UTC))
+                    .values(last_used_time=datetime.now(tz=UTC).replace(tzinfo=None))
                 )
                 await session.commit()
         return str(row["user_id"]), str(row["id"])

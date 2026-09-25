@@ -1,10 +1,14 @@
 """Request schemas for /api/space — field-level ports of packages/openapi/src/space."""
 
+import re as _re
 from typing import Any
 
-from pydantic import field_validator
+from pydantic import StrictBool, field_validator, model_validator
 
-from ...core.validation import ZodEnumStr, ZodModel
+from ...core.errors import ApiError, HttpErrorCode
+from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel
+
+_INTERNAL_SCHEMA_RE = _re.compile(r"^[a-z_]\w*$", _re.IGNORECASE)
 
 SPACE_NAME_MAX_LENGTH = 100
 
@@ -150,3 +154,78 @@ class DeleteCollaboratorQuery(ZodModel):
 
 class InvitationLinkBody(ZodModel):
     role: RoleStr
+
+
+class EmailInvitationBody(ZodModel):
+    emails: list[ZodEmailStr]
+    role: RoleStr
+
+
+class CreateIntegrationRo(ZodModel):
+    # createIntegrationRoSchema: type z.enum(IntegrationType={AI}), enable?, config.
+    # A single-member enum reports a literal-style issue ('expected "AI"'), the
+    # same for a wrong value and a missing key, so both are handled up front.
+    type: str | None = None
+    enable: StrictBool | None = None
+    config: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_ai_type(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("type") != "AI":
+            raise ApiError(
+                'Validation error: Invalid input: expected "AI" at "type"',
+                HttpErrorCode.VALIDATION_ERROR,
+            )
+        if isinstance(data, dict) and not isinstance(data.get("config"), dict):
+            raise ApiError(
+                "Validation error: Invalid input: expected object, received "
+                f"{_json_type(data.get('config'))} at \"config\"",
+                HttpErrorCode.VALIDATION_ERROR,
+            )
+        return data
+
+
+class UpdateIntegrationRo(ZodModel):
+    enable: StrictBool | None = None
+    config: dict[str, Any] | None = None
+
+
+_DATA_DB_TARGET_MODES = ["initialize-empty", "migrate-space", "adopt-existing"]
+
+
+class DataDbPreflightRo(ZodModel):
+    url: str
+    spaceId: str | None = None
+    targetMode: ZodEnumStr(_DATA_DB_TARGET_MODES) = "initialize-empty"
+    internalSchema: str | None = None
+    confirmLargeMigration: StrictBool | None = None
+    switchOnCompletion: StrictBool | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        if len(value) < 1:
+            raise ValueError("Too small: expected string to have >=1 characters")
+        return value
+
+    @field_validator("internalSchema")
+    @classmethod
+    def _internal_schema(cls, value: str | None) -> str | None:
+        if value is not None and not _INTERNAL_SCHEMA_RE.match(value):
+            raise ValueError("Invalid string: must match pattern /^[a-z_]\\w*$/i")
+        return value
+
+
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "undefined"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    return "object"

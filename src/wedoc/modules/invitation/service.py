@@ -1,7 +1,7 @@
 """Invitation domain service — ports features/invitation/invitation.service.ts.
 
-Link-based invitations only; email invitation lands with the mailer-driven
-flows later.
+Link and email invitations create collaborator + invitation + invitation_record
+rows; email delivery is a decoupled side effect (mailer, SMTP-gated) as upstream.
 """
 
 import hashlib
@@ -71,6 +71,79 @@ class InvitationService:
             "inviteUrl": self._invite_url(row["id"], code),
             "invitationCode": code,
         }
+
+    async def email_invitation(
+        self,
+        resource_id: str,
+        emails: list[str],
+        role: str,
+        resource_type: str = RESOURCE_SPACE,
+    ) -> dict[str, Any]:
+        from datetime import timedelta
+
+        from ..base import repository as base_repository
+        from ..user.service import UserService
+
+        space_id = resource_id if resource_type == RESOURCE_SPACE else None
+        base_id = resource_id if resource_type == RESOURCE_BASE else None
+        if resource_type == RESOURCE_SPACE:
+            if await repository.get_space_row(resource_id) is None:
+                raise ApiError(
+                    "Space not found",
+                    HttpErrorCode.NOT_FOUND,
+                    {"localization": {"i18nKey": "httpErrors.space.notFound"}},
+                )
+        elif await base_repository.get_base_row(resource_id) is None:
+            raise ApiError(
+                "Base not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.base.notFound"}},
+            )
+        await self.collaborators.validate_user_add_role(
+            cls.get("user.id"), role, resource_id, resource_type
+        )
+        user_service = UserService()
+        expired = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=30)
+        result: dict[str, Any] = {}
+        for email in emails:
+            user = await user_service.get_user_by_email(email.lower())
+            if user is None:
+                user = await user_service.create_user({"email": email.lower()})
+            collaborator = {"principalId": user["id"], "principalType": "user"}
+            if resource_type == RESOURCE_SPACE:
+                await self.collaborators.create_space_collaborator(
+                    [collaborator], resource_id, role
+                )
+            else:
+                await self.collaborators.create_base_collaborator(
+                    [collaborator], resource_id, role
+                )
+            invitation_id = new_id(IdPrefix.INVITATION)
+            await repository.insert_invitation(
+                {
+                    "id": invitation_id,
+                    "invitation_code": generate_invitation_code(invitation_id),
+                    "space_id": space_id,
+                    "base_id": base_id,
+                    "role": role,
+                    "type": "email",
+                    "expired_time": expired,
+                    "create_by": cls.get("user.id"),
+                }
+            )
+            await repository.insert_invitation_record(
+                {
+                    "id": cuid(),
+                    "invitation_id": invitation_id,
+                    "inviter": cls.get("user.id"),
+                    "accepter": user["id"],
+                    "type": "email",
+                    "space_id": space_id,
+                    "base_id": base_id,
+                }
+            )
+            result[email] = {"invitationId": invitation_id}
+        return result
 
     async def list_invitation_links(
         self, resource_id: str, resource_type: str = RESOURCE_SPACE

@@ -593,7 +593,11 @@ class PermissionService:
             if table_row and table_row[0]:
                 base_id = space_id = None
         if not space_id or not base_id:
-            raise ApiError(f"Invalid tableId: {table_id}", HttpErrorCode.NOT_FOUND)
+            raise ApiError(
+                f"Invalid tableId: {table_id}",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.table.notFound"}},
+            )
         cls.set("spaceId", space_id)
         return base_id, space_id
 
@@ -1241,7 +1245,9 @@ class PermissionGuard:
     ) -> bool:
         if not resource_id:
             raise ApiError(
-                "Permission check ID does not exist", HttpErrorCode.RESTRICTED_RESOURCE
+                "Permission check ID does not exist",
+                HttpErrorCode.RESTRICTED_RESOURCE,
+                {"localization": {"i18nKey": "httpErrors.permission.checkIdNotExist"}},
             )
         own_permissions = await self._permissions.valid_permissions(
             resource_id, permissions, cls.get("accessTokenId")
@@ -1624,6 +1630,14 @@ class PermissionGuard:
             )
 
 
-async def permission_guard(request: Request) -> bool:
-    """FastAPI dependency: the global PermissionGuard."""
-    return await PermissionGuard().can_activate(request)
+async def permission_guard(request: Request) -> None:
+    """FastAPI dependency: the global PermissionGuard.
+
+    Nest denies by returning ``false`` from ``canActivate``, which Nest turns
+    into a 403 ``ForbiddenException('Forbidden resource')``. FastAPI ignores a
+    dependency's return value, so a ``False`` verdict here must be raised
+    explicitly — otherwise the request would silently proceed (e.g. a scoped
+    PAT reaching a route that carries no ``@permissions``).
+    """
+    if not await PermissionGuard().can_activate(request):
+        raise ApiError("Forbidden resource", HttpErrorCode.RESTRICTED_RESOURCE)

@@ -8,14 +8,20 @@ from ...core.validation import ZodEnumStr, ZodModel
 
 USER_NAME_MAX_LENGTH = 100
 
-# zod enum over the TS LastVisitResourceType enum object: the bundled backend
-# compiles the enum with reverse mappings, so keys are accepted too and the
-# error lists values interleaved with keys (14 options, value|Key pairs).
-LAST_VISIT_RESOURCE_TYPE_OPTIONS: list[str] = []
-for _name in ("space", "base", "table", "view", "dashboard", "workflow", "app"):
-    LAST_VISIT_RESOURCE_TYPE_OPTIONS += [_name, _name.capitalize()]
+# LastVisitResourceType is a TS string enum, and z.enum(<string enum>) accepts
+# only its values (string enums have no reverse-mapping keys) — the exact set is
+# these 7 lowercase names, ordered as declared.
+LAST_VISIT_RESOURCE_TYPE_OPTIONS: list[str] = [
+    "space",
+    "base",
+    "table",
+    "view",
+    "dashboard",
+    "workflow",
+    "app",
+]
 
-LAST_VISIT_RESOURCE_TYPES = {opt.lower() for opt in LAST_VISIT_RESOURCE_TYPE_OPTIONS}
+LAST_VISIT_RESOURCE_TYPES = set(LAST_VISIT_RESOURCE_TYPE_OPTIONS)
 
 
 class UpdateUserNameBody(ZodModel):

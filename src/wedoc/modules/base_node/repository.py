@@ -7,9 +7,10 @@ with snake_case column names.
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ...db import engine as db_engine
-from ...db.models_meta import BaseNode, BaseNodeFolder
+from ...db.models_meta import BaseNode, BaseNodeFolder, Dashboard, TableMeta
 
 _UNSET: Any = object()
 
@@ -88,6 +89,39 @@ async def insert_node(fields: dict[str, Any]) -> dict[str, Any]:
             .mappings()
             .first()
         )
+        await session.commit()
+        return dict(row)
+
+
+async def upsert_node(
+    base_id: str,
+    resource_type: str,
+    resource_id: str,
+    create_fields: dict[str, Any],
+    update_fields: dict[str, Any],
+) -> dict[str, Any]:
+    """Insert or, on the (baseId, resourceType, resourceId) unique key, update.
+
+    Mirrors the reference upsert so a node-list reconciliation that already
+    materialised a root-level row for a resource created out of band is adopted
+    instead of colliding.
+    """
+    async with db_engine.session() as session:
+        stmt = (
+            pg_insert(BaseNode)
+            .values(
+                base_id=base_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                **create_fields,
+            )
+            .on_conflict_do_update(
+                index_elements=["base_id", "resource_type", "resource_id"],
+                set_=update_fields,
+            )
+            .returning(BaseNode.__table__)
+        )
+        row = (await session.execute(stmt)).mappings().first()
         await session.commit()
         return dict(row)
 
@@ -278,3 +312,58 @@ async def delete_folder_row(base_id: str, folder_id: str) -> dict[str, Any] | No
         )
         await session.commit()
         return dict(row) if row else None
+
+
+# ---- table resources ---------------------------------------------------------
+
+
+async def list_table_resource_rows(
+    base_id: str, ids: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Ports getTableResources: ready, non-deleted tables with the audit columns
+    the node resource meta exposes (no defaultViewId — the list VO omits it)."""
+    async with db_engine.session() as session:
+        stmt = select(
+            TableMeta.id,
+            TableMeta.name,
+            TableMeta.icon,
+            TableMeta.created_by,
+            TableMeta.created_time,
+            TableMeta.last_modified_by,
+            TableMeta.last_modified_time,
+        ).where(
+            TableMeta.base_id == base_id,
+            TableMeta.deleted_time.is_(None),
+            TableMeta.provision_state == "ready",
+        )
+        if ids is not None:
+            if not ids:
+                return []
+            stmt = stmt.where(TableMeta.id.in_(ids))
+        rows = (await session.execute(stmt)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# ---- dashboard resources -----------------------------------------------------
+
+
+async def list_dashboard_resource_rows(
+    base_id: str, ids: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Ports getDashboardResources: dashboards with the audit columns the node
+    resource meta exposes."""
+    async with db_engine.session() as session:
+        stmt = select(
+            Dashboard.id,
+            Dashboard.name,
+            Dashboard.created_by,
+            Dashboard.created_time,
+            Dashboard.last_modified_by,
+            Dashboard.last_modified_time,
+        ).where(Dashboard.base_id == base_id)
+        if ids is not None:
+            if not ids:
+                return []
+            stmt = stmt.where(Dashboard.id.in_(ids))
+        rows = (await session.execute(stmt)).mappings().all()
+    return [dict(r) for r in rows]

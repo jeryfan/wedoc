@@ -53,7 +53,14 @@ class Settings(BaseSettings):
     backend_session_origin_check_enabled: bool = False
     api_doc_disenabled: bool = False
     api_doc_enabled_snippet: bool = False
+    # reverse-proxy target that serves the Next.js frontend (page routes,
+    # _next assets, plugin iframe). When unset, page routes return 404.
+    wedoc_web_origin: str | None = None
+    plugin_server_origin: str | None = None
     timezone: str = "UTC"
+    # canary: FORCE_V2_ALL routes every v2-gated feature to the v2 implementation
+    # (matches the reference env flag); unset leaves v2 features disabled.
+    force_v2_all: bool = False
 
     # database: meta url resolution order meta > prisma > database
     prisma_meta_database_url: str | None = None

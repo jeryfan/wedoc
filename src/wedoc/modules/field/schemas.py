@@ -17,6 +17,8 @@ class FieldCreateBody(ZodModel):
     unique: bool | None = None
     notNull: bool | None = None
     isPrimary: bool | None = None
+    isLookup: bool | None = None
+    lookupOptions: dict[str, Any] | None = None
     options: dict[str, Any] | None = None
 
     @field_validator("name", mode="before")
@@ -54,6 +56,8 @@ class FieldConvertBody(ZodModel):
     dbFieldName: str | None = None
     unique: bool | None = None
     notNull: bool | None = None
+    isLookup: bool | None = None
+    lookupOptions: dict[str, Any] | None = None
     options: dict[str, Any] | None = None
 
 

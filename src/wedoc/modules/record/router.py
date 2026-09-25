@@ -1,8 +1,8 @@
 """Routes for /api/table/:tableId/record.
 
-Ports record-open-api.controller.ts. history/form-submit/TQL search land in
-later slices; attachments need the storage stack; collaborators and the
-socket snapshot/doc-ids endpoints are M3 realtime.
+Ports record-open-api.controller.ts. The socket snapshot-bulk/doc-ids fallback
+endpoints (M3 realtime) are implemented here; attachments need the storage
+stack and collaborators land with presence.
 """
 
 import json
@@ -10,10 +10,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 
+from ...core.errors import ApiError, HttpErrorCode
 from ...core.security.auth import auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
 from .schemas import (
+    InsertAttachmentBody,
     RecordBulkPatchBody,
     RecordCreateBody,
     RecordPatchBody,
@@ -36,11 +38,27 @@ def _json_param(raw: str | None) -> Any:
         return None
 
 
+@router.post("/socket/snapshot-bulk", status_code=201)
+@permissions("record|read")
+async def socket_snapshot_bulk(tableId: str, request: Request) -> list[dict[str, Any]]:
+    body = await read_json_body(request)
+    ids = body.get("ids") or []
+    projection = body.get("projection")
+    return await RecordService().socket_snapshot_bulk(tableId, ids, projection)
+
+
+@router.post("/socket/doc-ids", status_code=201)
+@permissions("record|read")
+async def socket_doc_ids(tableId: str, request: Request) -> dict[str, Any]:
+    body = await read_json_body(request)
+    return await RecordService().socket_doc_ids(tableId, body)
+
+
 @router.get("", status_code=200)
 @permissions("record|read")
 async def list_records(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
-    take = int(params.get("take") or 1000)
+    take = int(params.get("take") or 100)
     skip = int(params.get("skip") or 0)
     ignore_view_query = (params.get("ignoreViewQuery") or "").lower() == "true"
     return await RecordService().list_records(
@@ -51,12 +69,15 @@ async def list_records(tableId: str, request: Request) -> dict[str, Any]:
         filter_param=_json_param(params.get("filter")),
         sort_param=_json_param(params.get("sort")),
         order_by=_json_param(params.get("orderBy")),
+        group_by=_json_param(params.get("groupBy")),
+        collapsed_group_ids=_json_param(params.get("collapsedGroupIds")),
         tql=params.get("filterByTql"),
         search=params.getlist("search") or None,
         ignore_view_query=ignore_view_query,
         take=take,
         skip=skip,
         cursor=params.get("cursor"),
+        cell_format="text" if params.get("cellFormat") == "text" else "json",
     )
 
 
@@ -71,7 +92,7 @@ async def create_records(tableId: str, request: Request) -> dict[str, Any]:
 @permissions("record|update")
 async def update_records(tableId: str, request: Request) -> list[dict[str, Any]]:
     body = RecordBulkPatchBody.zod_validate(await read_json_body(request))
-    record_ids = request.query_params.getlist("recordIds")
+    record_ids = [item.id for item in body.records]
     return await RecordService().update_records(tableId, record_ids, body)
 
 
@@ -90,11 +111,35 @@ async def get_table_history(tableId: str, request: Request) -> dict[str, Any]:
     )
 
 
+@router.get("/collaborators", status_code=200)
+@permissions("record|read")
+async def get_collaborators(tableId: str, request: Request) -> list[dict[str, Any]]:
+    params = request.query_params
+    field_id = params.get("fieldId")
+    if field_id is None:
+        raise ApiError(
+            'Validation error: Invalid input: expected string, received undefined at "fieldId"',
+            HttpErrorCode.VALIDATION_ERROR,
+        )
+    query: dict[str, Any] = {"fieldId": field_id, "search": params.get("search")}
+    if params.get("skip") is not None:
+        query["skip"] = int(params["skip"])
+    if params.get("take") is not None:
+        query["take"] = int(params["take"])
+    return await RecordService().get_records_collaborators(tableId, query)
+
+
 @router.get("/{recordId}", status_code=200)
 @permissions("record|read")
 async def get_record(tableId: str, recordId: str, request: Request) -> dict[str, Any]:
-    field_key_type = request.query_params.get("fieldKeyType") or "name"
-    return await RecordService().get_record(tableId, recordId, field_key_type)
+    params = request.query_params
+    return await RecordService().get_record(
+        tableId,
+        recordId,
+        field_key_type=params.get("fieldKeyType") or "name",
+        projection=params.getlist("projection") or None,
+        cell_format="text" if params.get("cellFormat") == "text" else "json",
+    )
 
 
 @router.get("/{recordId}/history", status_code=200)
@@ -150,8 +195,23 @@ async def duplicate_record(tableId: str, recordId: str) -> dict[str, Any]:
 
 @router.get("/{recordId}/status", status_code=200)
 @permissions("record|read")
-async def get_record_status(tableId: str, recordId: str) -> dict[str, Any]:
-    return await RecordService().get_status(tableId, recordId)
+async def get_record_status(tableId: str, recordId: str, request: Request) -> dict[str, Any]:
+    params = request.query_params
+    take = params.get("take")
+    skip = params.get("skip")
+    return await RecordService().get_status(
+        tableId,
+        recordId,
+        view_id=params.get("viewId"),
+        filter_param=_json_param(params.get("filter")),
+        order_by=_json_param(params.get("orderBy")),
+        group_by=_json_param(params.get("groupBy")),
+        collapsed_group_ids=_json_param(params.get("collapsedGroupIds")),
+        search=params.getlist("search") or None,
+        ignore_view_query=(params.get("ignoreViewQuery") or "").lower() == "true",
+        take=int(take) if take and take.isdigit() else 100,
+        skip=int(skip) if skip and skip.isdigit() else 0,
+    )
 
 
 @router.post("/{recordId}/{fieldId}/auto-fill", status_code=201)
@@ -160,33 +220,50 @@ async def auto_fill_cell(tableId: str, recordId: str, fieldId: str) -> dict[str,
     return {"taskId": ""}
 
 
-@router.post("/{recordId}/{fieldId}/button-click", status_code=201)
+@router.post("/{recordId}/{fieldId}/uploadAttachment", status_code=201)
 @permissions("record|update")
-async def button_click(tableId: str, recordId: str, fieldId: str) -> Response:
-    from ...core.errors import ApiError, HttpErrorCode
-
-    raise ApiError(
-        "Field is not a Button field",
-        HttpErrorCode.VALIDATION_ERROR,
-        {
-            "domainCode": "button.field_type_invalid",
-            "domainTags": ["validation"],
-            "details": {"fieldId": fieldId},
-        },
+async def upload_attachment(
+    tableId: str, recordId: str, fieldId: str, request: Request
+) -> dict[str, Any]:
+    form = await request.form()
+    upload = form.get("file")
+    file_url = form.get("fileUrl")
+    file_arg: dict[str, Any] | None = None
+    if upload is not None and hasattr(upload, "read"):
+        data = await upload.read()
+        file_arg = {
+            "bytes": data,
+            "filename": upload.filename or "file",
+            "content_type": upload.content_type or "application/octet-stream",
+        }
+    return await RecordService().upload_attachment(
+        tableId,
+        recordId,
+        fieldId,
+        file_arg,
+        file_url if isinstance(file_url, str) else None,
     )
+
+
+@router.post("/{recordId}/{fieldId}/insertAttachment", status_code=201)
+@permissions("record|update")
+async def insert_attachment(
+    tableId: str, recordId: str, fieldId: str, request: Request
+) -> dict[str, Any]:
+    body = InsertAttachmentBody.zod_validate(await read_json_body(request))
+    return await RecordService().insert_attachment(
+        tableId, recordId, fieldId, body.attachments, body.anchorId
+    )
+
+
+@router.post("/{recordId}/{fieldId}/button-click", status_code=201)
+@permissions("record|read")
+async def button_click(tableId: str, recordId: str, fieldId: str) -> dict[str, Any]:
+    result = await RecordService().button_click(tableId, recordId, fieldId)
+    return {**result, "runId": ""}
 
 
 @router.post("/{recordId}/{fieldId}/button-reset", status_code=201)
 @permissions("record|update")
-async def button_reset(tableId: str, recordId: str, fieldId: str) -> Response:
-    from ...core.errors import ApiError, HttpErrorCode
-
-    raise ApiError(
-        "Field is not a Button field",
-        HttpErrorCode.VALIDATION_ERROR,
-        {
-            "domainCode": "button.field_type_invalid",
-            "domainTags": ["validation"],
-            "details": {"fieldId": fieldId},
-        },
-    )
+async def button_reset(tableId: str, recordId: str, fieldId: str) -> dict[str, Any]:
+    return await RecordService().reset_button(tableId, recordId, fieldId)

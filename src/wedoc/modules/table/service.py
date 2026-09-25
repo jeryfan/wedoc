@@ -58,9 +58,19 @@ CELL_VALUE_TYPES = {
     "multipleSelect": "string",
     "attachment": "string",
     "button": "string",
+    "link": "string",
 }
 
 MULTIPLE_CELL_TYPES = {"multipleSelect", "attachment", "user"}
+COMPUTED_FIELD_TYPES = {
+    "createdBy",
+    "lastModifiedBy",
+    "createdTime",
+    "lastModifiedTime",
+    "autoNumber",
+    "formula",
+    "rollup",
+}
 
 DB_FIELD_TYPES = {
     "singleLineText": "TEXT",
@@ -79,6 +89,7 @@ DB_FIELD_TYPES = {
     "user": "JSON",
     "attachment": "JSON",
     "button": "TEXT",
+    "link": "JSON",
 }
 
 RESERVED_DB_FIELD_NAMES = {
@@ -143,9 +154,9 @@ def _unsupported_field_type(field_type: str) -> ApiError:
 
 def _table_not_found(table_id: str, base_id: str) -> ApiError:
     return ApiError(
-        f"Table {table_id} not found in base {base_id}",
+        f"Table not found with id: {table_id}",
         HttpErrorCode.NOT_FOUND,
-        {"localization": {"i18nKey": "httpErrors.notFound"}},
+        {"localization": {"i18nKey": "httpErrors.table.notFound"}},
     )
 
 
@@ -153,6 +164,9 @@ def _normalize_options(field_type: str, options: dict[str, Any] | None) -> dict[
     options = dict(options) if options else {}
     if field_type == "number" and "formatting" not in options:
         options["formatting"] = {"type": "decimal", "precision": 2}
+    if field_type == "button":
+        options.setdefault("label", "Button")
+        options.setdefault("color", "teal")
     if field_type in ("singleSelect", "multipleSelect"):
         choices = []
         for choice in options.get("choices", []):
@@ -180,8 +194,13 @@ class TableService:
             [_raw(f) for f in body.fields] if body.fields else [dict(f) for f in DEFAULT_FIELDS]
         )
         view_ros = [_raw(v) for v in body.views] if body.views else [dict(v) for v in DEFAULT_VIEWS]
+        # Match ref createInitialRecords: an explicit empty list creates zero
+        # records; only an omitted (None) records field falls back to the
+        # canonical 3-empty-row default (applied by the public create route).
         record_ros = (
-            [_raw(r) for r in body.records] if body.records else [dict(r) for r in DEFAULT_RECORDS]
+            [_raw(r) for r in body.records]
+            if body.records is not None
+            else [dict(r) for r in DEFAULT_RECORDS]
         )
 
         if not any(f.get("isPrimary") for f in field_ros):
@@ -295,6 +314,9 @@ class TableService:
             base_id, table_id, prepared, record_ros, body.fieldKeyType or "name"
         )
 
+        from ...realtime.broadcast import broadcast_table_create
+
+        await broadcast_table_create(base_id, {"id": table_id})
         return {
             "id": table_id,
             "name": table_row["name"],
@@ -324,7 +346,17 @@ class TableService:
                 raise _unsupported_field_type(field_type)
             db_field_name = raw.get("dbFieldName") or ddl.convert_name_to_valid_character(name, 40)
             if db_field_name in seen_db_names:
-                db_field_name += str(int(time.time() * 1000))
+                # ref appends Date.now(); within one synchronous batch several
+                # colliding slugs (e.g. non-latin names that all reduce to
+                # "unnamed") would land on the same millisecond, so extend with a
+                # counter until unique to avoid a duplicate-column DDL failure.
+                stamped = f"{db_field_name}{int(time.time() * 1000)}"
+                candidate = stamped
+                counter = 1
+                while candidate in seen_db_names:
+                    candidate = f"{stamped}_{counter}"
+                    counter += 1
+                db_field_name = candidate
             seen_db_names.add(db_field_name)
             prepared.append(
                 {
@@ -351,7 +383,7 @@ class TableService:
         user_id = cls.get("user.id")
         columns = ["__id", "__created_by", "__version"] + [f["dbFieldName"] for f in fields]
         value_rows: list[list[Any]] = []
-        records_vo: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
         history_rows: list[dict[str, Any]] = []
         for record_ro in record_ros:
             raw = record_ro if isinstance(record_ro, dict) else record_ro.model_dump()
@@ -359,6 +391,7 @@ class TableService:
             record_id = new_id(IdPrefix.RECORD)
             values: list[Any] = [record_id, user_id, 1]
             vo_fields: dict[str, Any] = {}
+            name_value: Any = None
             for field in fields:
                 if field_key_type == "id":
                     value = record_fields.get(field["id"])
@@ -368,9 +401,10 @@ class TableService:
                         value = record_fields.get(field["id"])
                 db_value = _to_db_value(field, value) if value is not None else None
                 values.append(db_value)
-                vo_fields[field["name"]] = (
-                    db_value if field["type"] == "checkbox" else value
-                )
+                cell = db_value if field["type"] == "checkbox" else value
+                vo_fields[field["name"]] = cell
+                if field.get("isPrimary"):
+                    name_value = cell
                 # initial values are logged as cell history (null -> value) by the
                 # table-create path; records created via the record open API are not.
                 entry = build_history_row(
@@ -390,10 +424,29 @@ class TableService:
                 if entry:
                     history_rows.append(entry)
             value_rows.append(values)
-            records_vo.append({"id": record_id, "fields": vo_fields})
+            pending.append({"id": record_id, "fields": vo_fields, "name": name_value})
         await repository.insert_data_rows(base_id, table_id, columns, value_rows)
         if history_rows:
             await insert_record_history(history_rows)
+        meta = await repository.fetch_data_row_meta(
+            base_id, table_id, [record["id"] for record in pending]
+        )
+        records_vo: list[dict[str, Any]] = []
+        for record in pending:
+            row = meta.get(record["id"], {})
+            created_time = row.get("__created_time")
+            records_vo.append(
+                {
+                    "id": record["id"],
+                    "fields": record["fields"],
+                    "name": record["name"] if record["name"] is not None else "",
+                    "autoNumber": row.get("__auto_number"),
+                    "createdTime": _iso(created_time),
+                    "lastModifiedTime": _iso(row.get("__last_modified_time") or created_time),
+                    "createdBy": row.get("__created_by") or user_id,
+                    "lastModifiedBy": row.get("__last_modified_by") or user_id,
+                }
+            )
         return records_vo
 
     @staticmethod
@@ -409,6 +462,10 @@ class TableService:
         vo["cellValueType"] = CELL_VALUE_TYPES[field["type"]]
         vo["dbFieldType"] = DB_FIELD_TYPES[field["type"]]
         vo["type"] = field["type"]
+        if field["type"] in MULTIPLE_CELL_TYPES:
+            vo["isMultipleCellValue"] = True
+        if field["type"] in COMPUTED_FIELD_TYPES:
+            vo["isComputed"] = True
         vo["options"] = field["options"]
         return vo
 
@@ -441,14 +498,8 @@ class TableService:
 
     async def get_table(self, base_id: str, table_id: str) -> dict[str, Any]:
         table_row = await repository.get_table_meta_row(table_id, base_id, include_deleted=True)
-        if table_row is None:
+        if table_row is None or table_row["deleted_time"] is not None:
             raise _table_not_found(table_id, base_id)
-        if table_row["deleted_time"] is not None:
-            raise ApiError(
-                "Table not found",
-                HttpErrorCode.NOT_FOUND,
-                {"domainCode": "table.not_found", "domainTags": ["not-found"]},
-            )
         default_view_ids = await repository.get_default_view_ids([table_id])
         if table_id not in default_view_ids:
             raise ApiError(
@@ -458,32 +509,55 @@ class TableService:
             )
         return self._table_vo(table_row, default_view_ids[table_id])
 
+    async def get_default_view_id(self, table_id: str) -> dict[str, str]:
+        default_view_ids = await repository.get_default_view_ids([table_id])
+        view_id = default_view_ids.get(table_id)
+        if view_id is None:
+            raise ApiError(
+                f"View not found with tableId: {table_id}",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.view.notFound"}},
+            )
+        return {"id": view_id}
+
     async def update_name(self, base_id: str, table_id: str, name: str) -> None:
         table = await repository.get_table_meta_row(table_id, base_id)
         if table is None:
             raise _table_not_found(table_id, base_id)
+        version = table["version"] + 1
         await repository.update_table_meta_row(
             table_id,
             {
                 "name": name,
-                "version": table["version"] + 1,
+                "version": version,
                 "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
                 "last_modified_by": cls.get("user.id"),
             },
+        )
+        from ...realtime.broadcast import broadcast_table_update, set_property_op
+
+        await broadcast_table_update(
+            base_id, table_id, [set_property_op("name", name, table["name"])], version
         )
 
     async def update_icon(self, base_id: str, table_id: str, icon: str | None) -> None:
         table = await repository.get_table_meta_row(table_id, base_id)
         if table is None:
             raise _table_not_found(table_id, base_id)
+        version = table["version"] + 1
         await repository.update_table_meta_row(
             table_id,
             {
                 "icon": icon,
-                "version": table["version"] + 1,
+                "version": version,
                 "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
                 "last_modified_by": cls.get("user.id"),
             },
+        )
+        from ...realtime.broadcast import broadcast_table_update, set_property_op
+
+        await broadcast_table_update(
+            base_id, table_id, [set_property_op("icon", icon, table.get("icon"))], version
         )
 
     async def update_description(
@@ -492,14 +566,23 @@ class TableService:
         table = await repository.get_table_meta_row(table_id, base_id)
         if table is None:
             raise _table_not_found(table_id, base_id)
+        version = table["version"] + 1
         await repository.update_table_meta_row(
             table_id,
             {
                 "description": description,
-                "version": table["version"] + 1,
+                "version": version,
                 "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
                 "last_modified_by": cls.get("user.id"),
             },
+        )
+        from ...realtime.broadcast import broadcast_table_update, set_property_op
+
+        await broadcast_table_update(
+            base_id,
+            table_id,
+            [set_property_op("description", description, table.get("description"))],
+            version,
         )
 
     async def update_db_table_name(self, base_id: str, table_id: str, name: str) -> None:
@@ -522,6 +605,7 @@ class TableService:
         old = table["db_table_name"]
         old_table_name = old.split(".", 1)[1] if "." in old else old
         new_table_name = candidate.split(".", 1)[1]
+        version = table["version"] + 1
         await repository.execute_data_ddl(
             [ddl.rename_data_table_sql(base_id, old_table_name, new_table_name)]
         )
@@ -529,10 +613,15 @@ class TableService:
             table_id,
             {
                 "db_table_name": candidate,
-                "version": table["version"] + 1,
+                "version": version,
                 "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
                 "last_modified_by": cls.get("user.id"),
             },
+        )
+        from ...realtime.broadcast import broadcast_table_update, set_property_op
+
+        await broadcast_table_update(
+            base_id, table_id, [set_property_op("dbTableName", candidate, old)], version
         )
 
     async def update_order(
@@ -549,14 +638,20 @@ class TableService:
                 {"localization": {"i18nKey": "httpErrors.table.anchorNotFound"}},
             )
         new_order = await self._compute_order(base_id, anchor, position)
+        version = table["version"] + 1
         await repository.update_table_meta_row(
             table_id,
             {
                 "order": new_order,
-                "version": table["version"] + 1,
+                "version": version,
                 "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
                 "last_modified_by": cls.get("user.id"),
             },
+        )
+        from ...realtime.broadcast import broadcast_table_update, set_property_op
+
+        await broadcast_table_update(
+            base_id, table_id, [set_property_op("order", new_order, table["order"])], version
         )
 
     async def _compute_order(
@@ -585,9 +680,16 @@ class TableService:
         table = await repository.get_table_meta_row(table_id, base_id)
         if table is None:
             raise _table_not_found(table_id, base_id)
+        deleted_time = datetime.now(UTC).replace(tzinfo=None)
         await repository.soft_delete_table_row(
-            table_id, datetime.now(UTC).replace(tzinfo=None), table["version"] + 1
+            table_id, deleted_time, table["version"] + 1
         )
+        from ...realtime.broadcast import broadcast_table_delete
+
+        await broadcast_table_delete(base_id, table_id, table["version"])
+        from ..trash.listener import record_resource_deleted
+
+        await record_resource_deleted("table", table_id, base_id, deleted_time)
 
     async def permanent_delete_table(self, base_id: str, table_id: str) -> None:
         table = await repository.get_table_meta_row(table_id, base_id, include_deleted=True)
@@ -711,6 +813,9 @@ class TableService:
             }
             for f in source_fields
         ]
+        from ...realtime.broadcast import broadcast_table_create
+
+        await broadcast_table_create(base_id, {"id": new_table_id})
         return {
             "id": new_table_id,
             "name": name,
@@ -738,6 +843,64 @@ class TableService:
         rows = await repository.list_table_meta_rows(base_id)
         default_view_ids = await repository.get_default_view_ids([r["id"] for r in rows])
         return [self._table_vo(r, default_view_ids.get(r["id"])) for r in rows]
+
+    # ---- realtime socket snapshots -----------------------------------------
+
+    async def socket_doc_ids(
+        self, base_id: str, query: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        rows = await repository.list_table_meta_rows(base_id)
+        return {"ids": [r["id"] for r in rows]}
+
+    async def socket_snapshot_bulk(
+        self, base_id: str, ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """ShareDB table snapshots. See docs/api-parity-ledger.md: the permission
+        map and provisionState carry a wider raw shape than the REST table VO and
+        are best-effort here (documented gap)."""
+        if not ids:
+            return []
+        rows = {r["id"]: r for r in await repository.list_table_meta_rows(base_id)}
+        default_view_ids = await repository.get_default_view_ids(list(rows))
+        permission = await self._table_permission_map()
+        snapshots: list[dict[str, Any]] = []
+        for table_id in ids:
+            row = rows.get(table_id)
+            if row is None:
+                continue
+            order = row["order"]
+            snapshots.append(
+                {
+                    "id": table_id,
+                    "v": row["version"],
+                    "type": "json0",
+                    "data": {
+                        "id": table_id,
+                        "baseId": row["base_id"],
+                        "name": row["name"],
+                        "dbTableName": row["db_table_name"],
+                        "dbViewName": row.get("db_view_name"),
+                        "provisionState": row["provision_state"],
+                        "version": row["version"],
+                        "order": int(order) if float(order).is_integer() else order,
+                        "createdTime": _iso(row["created_time"]),
+                        "lastModifiedTime": _iso(
+                            row.get("last_modified_time") or row["created_time"]
+                        ),
+                        "deletedTime": _iso(row.get("deleted_time")),
+                        "createdBy": row["created_by"],
+                        "lastModifiedBy": row.get("last_modified_by") or row["created_by"],
+                        "defaultViewId": default_view_ids.get(table_id),
+                        "permission": permission,
+                    },
+                }
+            )
+        return snapshots
+
+    async def _table_permission_map(self) -> dict[str, bool]:
+        granted = cls.get("permissions") or []
+        actions = _TABLE_PERMISSION_RESOURCES.get("table", [])
+        return {action: (action in set(granted)) for action in actions}
 
 
 def _to_db_value(field: dict[str, Any], value: Any) -> Any:

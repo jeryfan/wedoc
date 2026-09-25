@@ -15,9 +15,12 @@ from ...core.security.auth import auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
 from .schemas import (
+    DASHBOARD,
+    TABLE,
+    CreateDashboardNodeBody,
     CreateFolderBody,
     CreateNodeBody,
-    DuplicateNodeBody,
+    CreateTableNodeBody,
     MoveNodeBody,
     UpdateFolderBody,
     UpdateNodeBody,
@@ -73,14 +76,26 @@ async def get_node(baseId: str, nodeId: str) -> dict[str, Any]:
 @router.post("", status_code=201)
 @permissions("base|read")
 async def create_node(baseId: str, request: Request) -> dict[str, Any]:
-    body = CreateNodeBody.zod_validate(await read_json_body(request))
+    raw = await read_json_body(request)
+    resource_type = raw.get("resourceType") if isinstance(raw, dict) else None
+    # createBaseNodeRoSchema is a discriminated union on resourceType: the table
+    # branch spreads the full create-table RO, the dashboard branch the dashboard
+    # RO. Pick the matching schema so fields/views (etc.) survive validation.
+    if resource_type == TABLE:
+        body: Any = CreateTableNodeBody.zod_validate(raw)
+    elif resource_type == DASHBOARD:
+        body = CreateDashboardNodeBody.zod_validate(raw)
+    else:
+        body = CreateNodeBody.zod_validate(raw)
     return await BaseNodeService().create(baseId, body)
 
 
 @router.post("/{nodeId}/duplicate", status_code=201)
 @permissions("base|read")
 async def duplicate_node(baseId: str, nodeId: str, request: Request) -> dict[str, Any]:
-    body = DuplicateNodeBody.zod_validate(await read_json_body(request))
+    # body is a union (table | dashboard | workflow/app) — pass the raw payload so
+    # table duplication keeps includeRecords, resolved per anchor resourceType.
+    body = await read_json_body(request)
     return await BaseNodeService().duplicate(baseId, nodeId, body)
 
 

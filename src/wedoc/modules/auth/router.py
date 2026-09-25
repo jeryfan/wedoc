@@ -104,6 +104,14 @@ async def invite_waitlist(request: Request) -> list[dict[str, Any]]:
     return await AuthService().invite_waitlist(body.list)
 
 
+def _waitlist_iso(dt: Any) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.isoformat(timespec="milliseconds") + "Z"
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 @router.get("/waitlist", status_code=200)
 @permissions("instance|read")
 async def get_waitlist() -> list[dict[str, Any]]:
@@ -112,14 +120,8 @@ async def get_waitlist() -> list[dict[str, Any]]:
         {
             "email": row["email"],
             "invite": row["invite"],
-            "inviteTime": (
-                row["invite_time"].isoformat(timespec="milliseconds").replace("+00:00", "Z")
-                if row["invite_time"]
-                else None
-            ),
-            "createdTime": row["created_time"]
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z"),
+            "inviteTime": _waitlist_iso(row["invite_time"]),
+            "createdTime": _waitlist_iso(row["created_time"]),
         }
         for row in rows
     ]

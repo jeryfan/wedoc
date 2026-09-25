@@ -58,6 +58,16 @@ class ZodNullable:
     """Annotated metadata marker: zod `.nullable()` — explicit null is accepted."""
 
 
+@dataclass(frozen=True)
+class ZodNonOptional:
+    """Annotated metadata marker: a field that was `.optional()` then `.required()`.
+
+    zod reports a missing such field as `expected nonoptional, received undefined`
+    (the ZodNonOptional wrapper's own type name), unlike a plain required string
+    which reports `expected string`.
+    """
+
+
 ZodNullableStr = Annotated[str | None, ZodNullable()]
 
 
@@ -183,20 +193,42 @@ def _join_path(loc: tuple[Any, ...]) -> str:
     return out
 
 
-def _field_expected(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> str | None:
-    """The zod 'expected' noun for a field path: string/number/boolean/array/object."""
+def _unwrap_union(node: Any) -> Any:
+    import types
+    import typing
+
+    if getattr(node, "__origin__", None) in (typing.Union, types.UnionType):
+        args = node.__args__
+        return next((a for a in args if a is not type(None)), node)
+    return node
+
+
+def _resolve_leaf(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> tuple[Any, Any]:
+    """Walk a Pydantic model along `loc`, descending list[...] item types on int
+    indices, and return (leaf_annotation, leaf_field_info). Either may be None."""
     node: Any = model
+    field: Any = None
     for part in loc:
+        if isinstance(part, int):
+            origin = getattr(node, "__origin__", None)
+            args = getattr(node, "__args__", ())
+            if origin is list and args:
+                node = _unwrap_union(args[0])
+                field = None
+                continue
+            return None, None
         if node is None or not isinstance(part, str):
-            return None
+            return None, None
         field = getattr(node, "model_fields", {}).get(part)
         if field is None:
-            return None
-        node = field.annotation
-        # unwrap Optional[...] / unions
-        args = getattr(node, "__args__", None)
-        if args:
-            node = next((a for a in args if a is not type(None)), node)
+            return None, None
+        node = _unwrap_union(field.annotation)
+    return node, field
+
+
+def _field_expected(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> str | None:
+    """The zod 'expected' noun for a field path: string/number/boolean/array/object."""
+    node, _field = _resolve_leaf(model, loc)
     if node is None:
         return None
     if isinstance(node, type):
@@ -206,15 +238,19 @@ def _field_expected(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> str 
             return "boolean"
         if issubclass(node, int | float):
             return "number"
-        if issubclass(node, BaseModel) or issubclass(node, dict):
+        if issubclass(node, BaseModel):
             return "object"
+        if issubclass(node, dict):
+            return "record"
         if issubclass(node, list):
             return "array"
     origin = getattr(node, "__origin__", None)
     if origin is list:
         return "array"
     if origin is dict:
-        return "object"
+        # dict[str, X] models a zod z.record(); a nested BaseModel models
+        # z.object(). zod reports "expected record" for the former.
+        return "record"
     return None
 
 
@@ -230,11 +266,14 @@ def _field_enum_spec(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> Zod
         for meta in field.metadata:
             if isinstance(meta, ZodEnumSpec):
                 return meta
-        node = field.annotation
-        args = getattr(node, "__args__", None)
-        if args:
-            node = next((a for a in args if a is not type(None)), node)
+        node = _unwrap_union(field.annotation)
     return None
+
+
+def _field_nonoptional(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> bool:
+    """True when the leaf field carries the ZodNonOptional marker."""
+    _node, field = _resolve_leaf(model, loc)
+    return field is not None and any(isinstance(m, ZodNonOptional) for m in field.metadata)
 
 
 def _translate(
@@ -254,6 +293,8 @@ def _translate(
         if spec is not None:
             joined = "|".join(f'"{v}"' for v in spec.options)
             return one(f"Invalid option: expected one of {joined}")
+        if _field_nonoptional(model, loc):
+            return one("Invalid input: expected nonoptional, received undefined")
         expected = _field_expected(model, loc) or "undefined"
         return one(f"Invalid input: expected {expected}, received undefined")
 

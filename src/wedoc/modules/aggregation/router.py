@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request, Response
 
 from ...core.errors import ApiError, HttpErrorCode
-from ...core.security.auth import auth_guard, permissions
+from ...core.security.auth import allow_anonymous, auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from .service import AggregationService
 
@@ -139,6 +139,7 @@ def _int_param(params: Any, name: str) -> int | None:
 
 @router.get("", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_aggregation(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     filter_param, tql = _tql_or_filter(params)
@@ -156,6 +157,7 @@ async def get_aggregation(tableId: str, request: Request) -> dict[str, Any]:
 
 @router.get("/row-count", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_row_count(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     filter_param, tql = _tql_or_filter(params)
@@ -179,6 +181,7 @@ async def get_row_count(tableId: str, request: Request) -> dict[str, Any]:
 
 @router.get("/record-index", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_record_index(tableId: str, request: Request):
     params = request.query_params
     record_id = params.get("recordId")
@@ -202,6 +205,7 @@ async def get_record_index(tableId: str, request: Request):
 
 @router.get("/search-count", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_search_count(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     return await AggregationService().get_search_count(
@@ -215,6 +219,7 @@ async def get_search_count(tableId: str, request: Request) -> dict[str, Any]:
 
 @router.get("/search-index", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_search_index(tableId: str, request: Request):
     params = request.query_params
     skip = _int_param(params, "skip") or 0
@@ -236,6 +241,7 @@ async def get_search_index(tableId: str, request: Request):
 
 @router.get("/group-points", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_group_points(tableId: str, request: Request) -> list[dict[str, Any]]:
     params = request.query_params
     filter_param, tql = _tql_or_filter(params)
@@ -254,6 +260,7 @@ async def get_group_points(tableId: str, request: Request) -> list[dict[str, Any
 
 @router.get("/calendar-daily-collection", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_calendar_daily_collection(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     missing = [
@@ -282,6 +289,7 @@ async def get_calendar_daily_collection(tableId: str, request: Request) -> dict[
 
 @router.get("/selection", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_selection_aggregation(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     filter_param, tql = _tql_or_filter(params)
@@ -302,5 +310,6 @@ async def get_selection_aggregation(tableId: str, request: Request) -> dict[str,
 
 @router.get("/task-status-collection", status_code=200)
 @permissions("table|read")
+@allow_anonymous()
 async def get_task_status_collection(tableId: str) -> dict[str, Any]:
     return {"fieldMap": {}, "cells": []}

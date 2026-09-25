@@ -158,6 +158,21 @@ class UserService:
     async def update_user_name(self, user_id: str, name: str) -> None:
         await repository.update_user_row(user_id, {"name": name})
 
+    async def create_system_user(
+        self, user_id: str, email: str, name: str
+    ) -> dict[str, Any]:
+        """Port of UserService.createSystemUser: is_system row + default avatar."""
+        avatar = await self._generate_default_avatar(user_id)
+        return await repository.create_user_row(
+            {
+                "id": user_id,
+                "email": email.lower(),
+                "name": name,
+                "avatar": avatar,
+                "is_system": True,
+            }
+        )
+
     async def update_avatar(self, user_id: str, file_bytes: bytes) -> None:
         cropped = crop_square_avatar(file_bytes)
         path = f"{AVATAR_BUCKET_DIR}/{user_id}"

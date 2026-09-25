@@ -6,11 +6,12 @@ permission/role views. Import/duplicate/template/export/connection/move/erd/
 publish routes are not registered yet (see docs/api-parity-ledger.md).
 """
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
@@ -18,7 +19,15 @@ from ...core.ids import IdPrefix, new_id, random_string
 from ...core.security.permissions import get_max_level_role
 from ...core.storage import get_public_full_storage_url
 from ...db import engine as db_engine
-from ...db.models_meta import BaseShare, Collaborator, Invitation, InvitationRecord, Trash
+from ...db.models_meta import (
+    BaseShare,
+    Collaborator,
+    Invitation,
+    InvitationRecord,
+    Space,
+    Template,
+    Trash,
+)
 from ...db.provider import create_schema_sql, drop_schema_sql
 from ..collaborator.service import RESOURCE_BASE, RESOURCE_SPACE, CollaboratorService
 from ..space import repository as space_repository
@@ -206,6 +215,170 @@ class BaseService:
             "icon": row["icon"],
         }
 
+    async def move_base(self, base_id: str, target_space_id: str) -> dict[str, Any]:
+        base = await repository.get_base_row(base_id)
+        if base is None or base["deleted_time"] is not None:
+            raise _not_found()
+        space = await space_repository.get_space_row(target_space_id)
+        if space is None:
+            raise ApiError(
+                "Space not found",
+                HttpErrorCode.VALIDATION_ERROR,
+                {"localization": {"i18nKey": "httpErrors.space.notFound"}},
+            )
+        from ...core.security.permissions import PermissionService
+
+        await PermissionService().valid_permissions(
+            target_space_id, ["base|create"], cls.get("accessTokenId")
+        )
+        # Single-PG deployment: no cross-data-DB physical move, and wedoc has no
+        # link fields yet, so there are no cross-space link conversions — a
+        # meta-only ownership transfer (base.spaceId update) suffices.
+        await repository.update_base_row(base_id, {"space_id": target_space_id})
+        return {}
+
+    @staticmethod
+    def _data_db_endpoint() -> dict[str, Any]:
+        # Single shared PG: both spaces resolve to the same meta-fallback
+        # endpoint (public schema), mirroring the reference dev deployment.
+        return {"mode": "default", "cacheKey": "meta-fallback", "internalSchema": "public"}
+
+    def _data_db_check(self) -> dict[str, Any]:
+        endpoint = self._data_db_endpoint()
+        return {
+            "sameDataDb": True,
+            "requiresPhysicalMove": False,
+            "source": endpoint,
+            "target": dict(endpoint),
+        }
+
+    async def check_move_base(
+        self, base_id: str, target_space_id: str
+    ) -> dict[str, Any]:
+        base = await repository.get_base_row(base_id)
+        if base is None or base["deleted_time"] is not None:
+            raise _not_found()
+        # No cross-space link fields in wedoc → no affected fields; the single
+        # shared PG always resolves to the same (meta-fallback) data database.
+        return {"affectedFields": [], "dataDb": self._data_db_check()}
+
+    async def get_move_job(self, base_id: str, job_id: str) -> dict[str, Any]:
+        # No physical cross-data-DB move ever runs on the single shared PG, so
+        # any job id is unknown.
+        raise ApiError(
+            f"Move job {job_id} not found",
+            HttpErrorCode.NOT_FOUND,
+        )
+
+    async def duplicate_base_check(
+        self, base_id: str, dest_space_id: str | None
+    ) -> dict[str, Any]:
+        base = await repository.get_base_row(base_id)
+        if base is None or base["deleted_time"] is not None:
+            raise _not_found()
+        return {"affectedFields": []}
+
+    async def create_base_from_template(
+        self, space_id: str, template_id: str, with_records: bool, base_id: str | None
+    ) -> dict[str, Any]:
+        # The template store (published template snapshots) is an M6 feature and
+        # has no table in wedoc yet. The reference resolves the template via
+        # prisma.template.findUniqueOrThrow, which for any non-existent id raises
+        # an unmapped Prisma error → 500. With no template store, every call here
+        # matches that 500; real template application lands with M6.
+        raise RuntimeError(
+            f"template store not available (M6): templateId={template_id}"
+        )
+
+    async def duplicate_base(
+        self,
+        from_base_id: str,
+        space_id: str,
+        with_records: bool,
+        name: str | None,
+    ) -> dict[str, Any]:
+        from ...core.security.permissions import PermissionService
+
+        source = await repository.get_base_row(from_base_id)
+        if source is None or source["deleted_time"] is not None:
+            raise _not_found()
+        # ref: base|update on the source. The share-copy path skips this (share
+        # grants access) and calls duplicate_base_impl directly.
+        await PermissionService().valid_permissions(
+            from_base_id, ["base|update"], cls.get("accessTokenId")
+        )
+        return await self.duplicate_base_impl(from_base_id, space_id, with_records, name)
+
+    async def duplicate_base_impl(
+        self,
+        from_base_id: str,
+        space_id: str,
+        with_records: bool,
+        name: str | None,
+    ) -> dict[str, Any]:
+        from types import SimpleNamespace
+
+        from ..field.service import FieldService
+        from ..record.service import RecordService
+        from ..table import repository as table_repository
+        from ..table.service import TableService
+
+        source = await repository.get_base_row(from_base_id)
+        if source is None or source["deleted_time"] is not None:
+            raise _not_found()
+
+        new_name = name or f"{source['name']} (Copy)"
+        new_base = await self.create_base(space_id, new_name, source.get("icon"))
+        new_base_id = new_base["id"]
+
+        table_service = TableService()
+        field_service = FieldService()
+        record_service = RecordService()
+
+        tables = await table_service.list_tables(from_base_id)
+        for table in tables:
+            fields = await field_service.list_fields(table["id"])
+            field_ros = [
+                {
+                    "name": f["name"],
+                    "type": f["type"],
+                    "dbFieldName": f["dbFieldName"],
+                    "options": f.get("options"),
+                    "isPrimary": f.get("isPrimary") or None,
+                    "notNull": f.get("notNull") or None,
+                    "unique": f.get("unique") or False,
+                }
+                for f in fields
+            ]
+            view_rows = await table_repository.list_view_rows(table["id"])
+            # columnMeta references source field ids; omitted here so create_table
+            # regenerates it against the new field ids (matches the reference for
+            # default views — custom column widths/hidden flags are not preserved,
+            # a documented simplification since wedoc has no link/computed fields).
+            view_ros = [{"name": v["name"], "type": v["type"]} for v in view_rows]
+            record_ros: list[dict[str, Any]] = []
+            if with_records:
+                data = await record_service.list_records(
+                    table["id"], field_key_type="name", take=100000
+                )
+                record_ros = [{"fields": r["fields"]} for r in data["records"]]
+            body = SimpleNamespace(
+                name=table["name"],
+                fields=field_ros,
+                views=view_ros,
+                records=record_ros,
+                fieldKeyType=None,
+                dbTableName=None,
+            )
+            await table_service.create_table(new_base_id, body)
+
+        return {
+            "id": new_base_id,
+            "name": new_name,
+            "spaceId": space_id,
+            "icon": source.get("icon"),
+        }
+
     async def update_order(self, base_id: str, anchor_id: str, position: str) -> None:
         base = await repository.get_base_row(base_id)
         if base is None:
@@ -255,16 +428,40 @@ class BaseService:
         base = await repository.get_base_row(base_id)
         if base is None:
             raise _not_found()
-        await repository.soft_delete_base_row(
-            base_id, datetime.now(UTC).replace(tzinfo=None)
+        deleted_time = datetime.now(UTC).replace(tzinfo=None)
+        await repository.soft_delete_base_row(base_id, deleted_time)
+        from ..trash.listener import record_resource_deleted
+
+        await record_resource_deleted(
+            "base", base_id, base["space_id"], deleted_time
         )
 
     async def permanent_delete_base(self, base_id: str) -> None:
+        from ...core.security.permissions import PermissionService
+
+        await PermissionService().valid_permissions(
+            base_id, ["base|delete"], cls.get("accessTokenId"), True
+        )
         base = await repository.get_base_row(base_id, include_deleted=True)
         if base is None:
             raise _not_found()
+        # drop physical schema, then clear all table meta rows (any state) so the
+        # base row is no longer referenced by table_meta_base_id_fkey.
+        from ...db.models_meta import Field, TableMeta, View
+
         async with db_engine.session() as session:
             await session.execute(text(drop_schema_sql(base_id)))
+            table_ids = (
+                await session.execute(
+                    select(TableMeta.id).where(TableMeta.base_id == base_id)
+                )
+            ).scalars().all()
+            if table_ids:
+                await session.execute(delete(Field).where(Field.table_id.in_(table_ids)))
+                await session.execute(delete(View).where(View.table_id.in_(table_ids)))
+                await session.execute(
+                    delete(TableMeta).where(TableMeta.base_id == base_id)
+                )
             await session.commit()
         await self._clean_base_related_data(base_id)
 
@@ -345,3 +542,136 @@ class BaseService:
     async def get_permission(self) -> dict[str, bool]:
         granted = cls.get("permissions") or []
         return {action: action in granted for action in _PERMISSION_ACTIONS}
+
+    async def generate_base_erd(self, base_id: str) -> dict[str, Any]:
+        from ..field.service import FieldService
+        from ..table.service import TableService
+
+        # nodes are the base's tables (ordered) with their fields; edges derive
+        # from link fields (none until link lands, so edges stay empty here).
+        tables = await TableService().list_tables(base_id)
+        field_service = FieldService()
+        nodes: list[dict[str, Any]] = []
+        for table in tables:
+            fields = await field_service.list_fields(table["id"])
+            items: list[dict[str, Any]] = []
+            for f in fields:
+                item = {"id": f["id"], "name": f["name"], "type": f["type"]}
+                if f.get("isLookup"):
+                    item["isLookup"] = True
+                items.append(item)
+            node: dict[str, Any] = {"id": table["id"], "name": table["name"], "fields": items}
+            if table.get("icon") is not None:
+                node["icon"] = table["icon"]
+            nodes.append(node)
+        return {"baseId": base_id, "nodes": nodes, "edges": []}
+
+    async def _template_space_id(self) -> str:
+        async with db_engine.session() as session:
+            row = (
+                await session.execute(
+                    select(Space.id).where(
+                        Space.is_template.is_(True), Space.deleted_time.is_(None)
+                    )
+                )
+            ).first()
+            if row is not None:
+                return row[0]
+            space_id = new_id(IdPrefix.SPACE)
+            await session.execute(
+                Space.__table__.insert().values(
+                    id=space_id,
+                    name="Templates",
+                    is_template=True,
+                    created_by=cls.get("user.id"),
+                )
+            )
+            await session.commit()
+        return space_id
+
+    async def publish_base(self, base_id: str, body: Any) -> dict[str, Any]:
+        source = await repository.get_base_row(base_id)
+        if source is None or source["deleted_time"] is not None:
+            raise _not_found()
+        template_space_id = await self._template_space_id()
+        include_data = body.includeData if body.includeData is not None else True
+        snapshot = await self.duplicate_base_impl(
+            base_id, template_space_id, include_data, source["name"]
+        )
+        snapshot_base_id = snapshot["id"]
+        now = datetime.now(UTC).replace(tzinfo=None)
+        snapshot_json = json.dumps(
+            {
+                "baseId": snapshot_base_id,
+                "snapshotTime": _iso(now),
+                "spaceId": template_space_id,
+                "name": source["name"],
+            },
+            separators=(",", ":"),
+        )
+        publish_info = {
+            "nodes": body.nodes,
+            "includeData": body.includeData,
+            "defaultActiveNodeId": body.defaultActiveNodeId,
+            "snapshotActiveNodeId": None,
+            "defaultUrl": None,
+        }
+        user_id = cls.get("user.id")
+        async with db_engine.session() as session:
+            existing = (
+                await session.execute(
+                    select(Template.id, Template.snapshot).where(Template.base_id == base_id)
+                )
+            ).first()
+            if existing is not None:
+                template_id = existing[0]
+                old_snapshot = json.loads(existing[1]) if existing[1] else None
+                await session.execute(
+                    Template.__table__.update()
+                    .where(Template.id == template_id)
+                    .values(
+                        name=body.title,
+                        description=body.description,
+                        snapshot=snapshot_json,
+                        publish_info=publish_info,
+                        last_modified_by=user_id,
+                        last_modified_time=now,
+                    )
+                )
+                await session.commit()
+                if old_snapshot and old_snapshot.get("baseId"):
+                    await self._drop_snapshot_base(old_snapshot["baseId"])
+            else:
+                template_id = new_id(IdPrefix.TEMPLATE)
+                max_order = (
+                    await session.execute(select(func.max(Template.order)))
+                ).scalar()
+                await session.execute(
+                    Template.__table__.insert().values(
+                        id=template_id,
+                        base_id=base_id,
+                        name=body.title,
+                        description=body.description,
+                        snapshot=snapshot_json,
+                        publish_info=publish_info,
+                        order=(max_order or 0) + 1,
+                        created_by=user_id,
+                        last_modified_time=now,
+                    )
+                )
+                await session.commit()
+        return {
+            "baseId": snapshot_base_id,
+            "defaultUrl": None,
+            "permalink": f"/t/{template_id}",
+        }
+
+    async def _drop_snapshot_base(self, snapshot_base_id: str) -> None:
+        # best-effort cleanup of a superseded snapshot base in the template space
+        base = await repository.get_base_row(snapshot_base_id)
+        if base is None:
+            return
+        try:
+            await self.permanent_delete_base(snapshot_base_id)
+        except Exception:
+            pass

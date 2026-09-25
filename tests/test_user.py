@@ -252,17 +252,20 @@ async def test_last_visit_flow(client, db):
         )
         assert resp.status_code == 400
         assert resp.json()["message"].startswith(
-            'Validation error: Invalid option: expected one of "space"|"Space"|'
+            'Validation error: Invalid option: expected one of '
+            '"space"|"base"|"table"|"view"|"dashboard"|"workflow"|"app"'
         )
 
+        # capitalized values are rejected at the schema layer: the upstream
+        # z.enum(LastVisitResourceType) accepts only the lowercase ResourceType
+        # values, so a PascalCase resourceType is a zod validation error.
         resp = await client.get(
             "/api/user/last-visit",
             params={"resourceType": "Space", "parentResourceId": "x"},
         )
         assert resp.status_code == 400
-        assert resp.json()["data"]["localization"]["i18nKey"] == (
-            "httpErrors.lastVisit.invalidResourceType"
-        )
+        assert resp.json()["code"] == "validation_error"
+        assert '"Space"' not in resp.json()["message"]
 
         resp = await client.get(
             "/api/user/last-visit",

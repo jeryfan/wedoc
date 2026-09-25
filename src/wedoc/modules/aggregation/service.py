@@ -9,7 +9,7 @@ byte-for-byte.
 """
 
 import json
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -215,9 +215,9 @@ class AggregationService:
             view = await get_view_row(table_id, view_id)
             if view is None:
                 raise ApiError(
-                    f"View not found: {view_id}",
+                    f"View {view_id} not found",
                     HttpErrorCode.NOT_FOUND,
-                    {"domainCode": "view.not_found", "domainTags": ["not-found"]},
+                    {"localization": {"i18nKey": "httpErrors.view.notFound"}},
                 )
             view_filter = json.loads(view["filter"]) if view.get("filter") else None
         if view_filter and filter_param:
@@ -251,7 +251,6 @@ class AggregationService:
         search: list[Any],
         params: dict[str, Any],
         counter: list[int],
-        strict: bool = False,
     ) -> str | None:
         # substring search mirroring SearchQueryPostgres: ILIKE with escaped
         # wildcards; number fields round to their display precision first.
@@ -264,19 +263,8 @@ class AggregationService:
             if field is not None and field not in targets:
                 targets.append(field)
         if not targets:
-            # the index/count endpoints resolve the field up front and 404;
-            # the statistic endpoints silently ignore an unresolvable search.
-            if strict:
-                key = str(search[1]) if len(search) >= 2 else ""
-                raise ApiError(
-                    f"Field not found: {key}",
-                    HttpErrorCode.NOT_FOUND,
-                    {
-                        "domainCode": "not_found",
-                        "domainTags": ["not-found"],
-                        "details": {"fieldKey": key},
-                    },
-                )
+            # an empty or unresolvable field ref selects no search fields, as in
+            # getSearchFields; search-count/-index then answer {count: 0} / null.
             return None
         clauses = []
         for field in targets:
@@ -391,9 +379,9 @@ class AggregationService:
             view = await get_view_row(table_id, view_id)
             if view is None:
                 raise ApiError(
-                    f"View not found: {view_id}",
+                    f"View {view_id} not found",
                     HttpErrorCode.NOT_FOUND,
-                    {"domainCode": "view.not_found", "domainTags": ["not-found"]},
+                    {"localization": {"i18nKey": "httpErrors.view.notFound"}},
                 )
             column_meta = json.loads(view["column_meta"]) if view.get("column_meta") else {}
             for field in fields:
@@ -489,6 +477,33 @@ class AggregationService:
             return f"TIMEZONE('{tz}', DATE_TRUNC('{unit}', TIMEZONE('{tz}', {column})))"
         return column
 
+    def _group_select_expr(self, field: dict[str, Any]) -> str:
+        # link fields group on the denormalized {id,title} cell (db-provider
+        # group-query json branch). Single-value selects the rebuilt object
+        # (null when the cell is empty); multi-value selects the group's array.
+        column = f'"{field["db_field_name"]}"'
+        if field["type"] == "link":
+            if field.get("is_multiple_cell_value"):
+                return f"(jsonb_agg({column}::jsonb) -> 0)"
+            return (
+                f"CASE WHEN {column}::jsonb ->> 'id' IS NULL"
+                f" AND {column}::jsonb ->> 'title' IS NULL THEN NULL"
+                f" ELSE jsonb_build_object('id', {column}::jsonb ->> 'id',"
+                f" 'title', {column}::jsonb ->> 'title') END"
+            )
+        return self._group_expr(field)
+
+    def _group_by_exprs(self, field: dict[str, Any]) -> list[str]:
+        column = f'"{field["db_field_name"]}"'
+        if field["type"] == "link":
+            if field.get("is_multiple_cell_value"):
+                return [
+                    f"jsonb_path_query_array({column}::jsonb,'$[*].id')::text",
+                    f"jsonb_path_query_array({column}::jsonb,'$[*].title')::text",
+                ]
+            return [f"{column}::jsonb ->> 'id'", f"{column}::jsonb ->> 'title'"]
+        return [self._group_expr(field)]
+
     def _grouped_query(
         self,
         table: dict[str, Any],
@@ -496,17 +511,19 @@ class AggregationService:
         prefix: list[tuple[dict[str, Any], str]],
         where_sql: str,
     ) -> str:
-        group_exprs = [self._group_expr(field) for field, _ in prefix]
         select_exprs = ", ".join(
-            f'{expr} AS "{field["db_field_name"]}"'
-            for (field, _), expr in zip(prefix, group_exprs, strict=True)
+            f'{self._group_select_expr(field)} AS "{field["db_field_name"]}"'
+            for field, _ in prefix
+        )
+        group_by = ", ".join(
+            expr for field, _ in prefix for expr in self._group_by_exprs(field)
         )
         order_terms = ", ".join(
             self._group_order(field, order) for field, order in prefix
         )
         return (
             f"SELECT {select_exprs}, {selects} FROM {self._table_ref(table)}"
-            f"{where_sql} GROUP BY {', '.join(group_exprs)} ORDER BY {order_terms}"
+            f"{where_sql} GROUP BY {group_by} ORDER BY {order_terms}"
         )
 
     def _group_order(self, field: dict[str, Any], order: str) -> str:
@@ -519,6 +536,14 @@ class AggregationService:
                 column = f'"{field["db_field_name"]}"'
                 array_literal = "ARRAY[" + ", ".join(f"'{n}'" for n in names) + "]"
                 return f"ARRAY_POSITION({array_literal}, {column}) {direction} {nulls}"
+        if field["type"] == "link":
+            # order groups by link title (record-query orderAggregateByGroup).
+            column = f'"{field["db_field_name"]}"'
+            if field.get("is_multiple_cell_value"):
+                expr = f"jsonb_path_query_array({column}::jsonb,'$[*].title')::text"
+            else:
+                expr = f"{column}::jsonb ->> 'title'"
+            return f"{expr} {direction} {nulls}"
         return f"{self._group_expr(field)} {direction} {nulls}"
 
     @staticmethod
@@ -609,7 +634,7 @@ class AggregationService:
         filter_obj = await self._merged_filter(table_id, view_id, filter_param, ignore_view_query)
         where_sql, params = self._compile_where(fields, filter_obj, None, exact_only=False)
         counter = [0]
-        clause = self._search_clause(fields, search, params, counter, strict=True)
+        clause = self._search_clause(fields, search, params, counter)
         if clause is None:
             return {"count": 0}
         where_sql += f'{" AND" if where_sql else " WHERE"} ({clause})'
@@ -654,7 +679,7 @@ class AggregationService:
         where_sql, params = self._compile_where(fields, filter_obj, None, exact_only=False)
         search_params = dict(params)
         counter = [0]
-        clause = self._search_clause(fields, search, search_params, counter, strict=True)
+        clause = self._search_clause(fields, search, search_params, counter)
         if clause is None:
             return None
 
@@ -742,26 +767,46 @@ class AggregationService:
         if tql:
             filter_obj = self._parse_tql(tql)
         where_sql, params = self._compile_where(fields, filter_obj, search, exact_only=True)
+        rows = await self._run_group_query(table, group_fields, where_sql, params)
+        row_count = await count_rows(table["base_id"], table_id, where_sql, params)
+        points, _refs = self._build_group_points(group_fields, rows, row_count, collapsed_ids)
+        return points
 
-        group_exprs = [self._group_expr(field) for field, _ in group_fields]
+    async def _run_group_query(
+        self,
+        table: dict[str, Any],
+        group_fields: list[tuple[dict[str, Any], str]],
+        where_sql: str,
+        params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         select_exprs = ", ".join(
-            f'{expr} AS "{field["db_field_name"]}"'
-            for (field, _), expr in zip(group_fields, group_exprs, strict=True)
+            f'{self._group_select_expr(field)} AS "{field["db_field_name"]}"'
+            for field, _ in group_fields
+        )
+        group_by = ", ".join(
+            expr for field, _ in group_fields for expr in self._group_by_exprs(field)
         )
         order_terms = ", ".join(
             self._group_order(field, order) for field, order in group_fields
         )
-        rows = await repository.raw_rows(
+        return await repository.raw_rows(
             f"SELECT {select_exprs}, COUNT(*) AS __c FROM {self._table_ref(table)}"
-            f"{where_sql} GROUP BY {', '.join(group_exprs)} ORDER BY {order_terms}",
+            f"{where_sql} GROUP BY {group_by} ORDER BY {order_terms}",
             params,
         )
-        row_count = await count_rows(table["base_id"], table_id, where_sql, params)
 
+    def _build_group_points(
+        self,
+        group_fields: list[tuple[dict[str, Any], str]],
+        rows: list[dict[str, Any]],
+        row_count: int,
+        collapsed_ids: list[str] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         sentinel = object()
         values: list[Any] = [sentinel, sentinel, sentinel]
         collapsed = set(collapsed_ids or [])
         points: list[dict[str, Any]] = []
+        refs: list[dict[str, Any]] = []
         current_count = 0
         collapsed_depth = len(group_fields) + 1
         for row in rows:
@@ -777,6 +822,7 @@ class AggregationService:
                 ] + [stringified]
                 flag = f"{field['id']}_" + "_".join("" if p is None else p for p in parts)
                 group_id = str(_string2hash(flag))
+                refs.append({"id": group_id, "depth": depth})
                 if depth > collapsed_depth:
                     break
                 collapsed_depth = len(group_fields) + 1
@@ -810,7 +856,30 @@ class AggregationService:
                 }
             )
             points.append({"type": 1, "count": row_count - current_count})
-        return points
+        return points, refs
+
+    async def group_points_for_records(
+        self,
+        table: dict[str, Any],
+        fields: list[dict[str, Any]],
+        group_by: list[dict[str, Any]] | None,
+        where_sql: str,
+        params: dict[str, Any],
+        collapsed_ids: list[str] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+        # Shared with the record list: returns (groupPoints, allGroupHeaderRefs)
+        # computed over the already-compiled filter (cursor/pagination excluded).
+        group_fields = []
+        for item in group_by or []:
+            field = self._records._resolve_field(fields, item.get("fieldId", ""))
+            if field is not None:
+                group_fields.append((field, item.get("order", "asc")))
+        group_fields = group_fields[:3]
+        if not group_fields:
+            return None
+        rows = await self._run_group_query(table, group_fields, where_sql, params)
+        row_count = await count_rows(table["base_id"], table["id"], where_sql, params)
+        return self._build_group_points(group_fields, rows, row_count, collapsed_ids)
 
     @staticmethod
     def _header_value(field: dict[str, Any], raw: Any) -> Any:
@@ -888,10 +957,12 @@ class AggregationService:
         GROUP BY dates.date
         ORDER BY dates.date ASC
         """
-        # asyncpg rejects str for timestamptz casts; date binds encode natively.
+        # The client sends ISO instants (e.g. ...Z); bind aware datetimes so
+        # asyncpg encodes them as timestamptz and the AT TIME ZONE :tz date
+        # bucketing below stays correct (date.fromisoformat can't parse a time).
         bind = {
-            "start": date.fromisoformat(start_date),
-            "end": date.fromisoformat(end_date),
+            "start": datetime.fromisoformat(start_date.replace("Z", "+00:00")),
+            "end": datetime.fromisoformat(end_date.replace("Z", "+00:00")),
             "tz": tz,
             **params,
         }
