@@ -40,6 +40,17 @@ async def get_field_row(
     return _row(row) if row else None
 
 
+async def get_field_row_by_id(
+    field_id: str, include_deleted: bool = False
+) -> dict[str, Any] | None:
+    async with db_engine.session() as session:
+        stmt = select(Field).where(Field.id == field_id)
+        if not include_deleted:
+            stmt = stmt.where(Field.deleted_time.is_(None))
+        row = (await session.execute(stmt)).scalars().first()
+    return _row(row) if row else None
+
+
 async def list_fields_referencing_foreign_table(
     foreign_table_id: str,
 ) -> list[dict[str, Any]]:

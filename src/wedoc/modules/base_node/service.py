@@ -16,6 +16,7 @@ from typing import Any
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.ids import IdPrefix, new_id
+from ...core.storage import get_public_full_storage_url
 from ..space import repository as space_repository
 from ..space.service import get_uniq_name
 from . import repository
@@ -38,6 +39,15 @@ def _not_found(node_id: str) -> ApiError:
         HttpErrorCode.NOT_FOUND,
         {"localization": {"i18nKey": "httpErrors.baseNode.notFound"}},
     )
+
+
+async def _resolve_node_id(base_id: str, node_id: str) -> str:
+    # ref resolveRequestNodeIds: an id in the nodeId slot that is not a BaseNode
+    # id is treated as a resourceId and rewritten to the owning node's id.
+    if not isinstance(node_id, str) or node_id.startswith(IdPrefix.BASE_NODE):
+        return node_id
+    resolved = await repository.get_node_id_by_resource_id(base_id, node_id)
+    return resolved or node_id
 
 
 def _invalid_resource_type(resource_type: str) -> ApiError:
@@ -78,7 +88,12 @@ class BaseNodeService:
             return {}
         users = await space_repository.list_user_rows_by_ids(ids)
         return {
-            u["id"]: {"id": u["id"], "name": u["name"], "email": u["email"], "avatar": u["avatar"]}
+            u["id"]: {
+                "id": u["id"],
+                "name": u["name"],
+                "email": u["email"],
+                "avatar": get_public_full_storage_url(u["avatar"]) if u["avatar"] else None,
+            }
             for u in users
         }
 
@@ -109,12 +124,15 @@ class BaseNodeService:
         resource_meta["lastModifiedTime"] = _iso(resource.get("last_modified_time"))
         resource_meta["lastModifiedByUser"] = resolve_user(resource.get("last_modified_by"))
         resource_type = entry["resource_type"]
+        order = entry["order"]
+        if isinstance(order, float) and order.is_integer():
+            order = int(order)
         return {
             "id": entry["id"],
             "baseId": entry["base_id"],
             "parentId": entry["parent_id"],
             "resourceId": entry["resource_id"],
-            "order": entry["order"],
+            "order": order,
             "resourceType": resource_type,
             "parent": {"id": entry["parent_id"]} if entry["parent_id"] else None,
             "children": children,
@@ -171,6 +189,7 @@ class BaseNodeService:
         return {"nodes": await self._prepare_node_list(base_id), "maxFolderDepth": MAX_FOLDER_DEPTH}
 
     async def get_node_vo(self, base_id: str, node_id: str) -> dict[str, Any]:
+        node_id = await _resolve_node_id(base_id, node_id)
         entry = await repository.get_node_row(node_id)
         if entry is None or entry["base_id"] != base_id:
             raise _not_found(node_id)
@@ -336,6 +355,7 @@ class BaseNodeService:
         return folder
 
     async def duplicate(self, base_id: str, node_id: str, body: Any) -> dict[str, Any]:
+        node_id = await _resolve_node_id(base_id, node_id)
         anchor = await repository.get_node_row(node_id)
         if anchor is None or anchor["base_id"] != base_id:
             raise _not_found(node_id)
@@ -402,23 +422,47 @@ class BaseNodeService:
         raise _invalid_resource_type(resource_type)
 
     async def update(self, base_id: str, node_id: str, body: Any) -> dict[str, Any]:
+        node_id = await _resolve_node_id(base_id, node_id)
         entry = await repository.get_node_row(node_id)
         if entry is None or entry["base_id"] != base_id:
             raise _not_found(node_id)
-        resource_type = entry["resource_type"]
-        if resource_type == RESOURCE_FOLDER:
-            if body.name:
-                await rename_folder(base_id, entry["resource_id"], body.name)
-        else:
-            raise _invalid_resource_type(resource_type)
+        await self._update_resource(base_id, entry["resource_type"], entry["resource_id"], body)
         return await self._vo(entry)
 
+    async def _update_resource(
+        self, base_id: str, resource_type: str, resource_id: str, body: Any
+    ) -> None:
+        name = body.name
+        if resource_type == RESOURCE_FOLDER:
+            if name:
+                await rename_folder(base_id, resource_id, name)
+        elif resource_type == TABLE:
+            from ..table.service import TableService
+
+            table_service = TableService()
+            if name:
+                await table_service.update_name(base_id, resource_id, name)
+            if "icon" in body.model_fields_set:
+                await table_service.update_icon(base_id, resource_id, body.icon)
+        elif resource_type == DASHBOARD:
+            from ..dashboard.service import DashboardService
+
+            if name:
+                await DashboardService().rename_dashboard(base_id, resource_id, name)
+        else:
+            raise _invalid_resource_type(resource_type)
+
     async def move(self, base_id: str, node_id: str, body: Any) -> dict[str, Any]:
+        node_id = await _resolve_node_id(base_id, node_id)
         node = await repository.get_node_row(node_id)
         if node is None or node["base_id"] != base_id:
             raise _not_found(node_id)
         parent_id = body.parentId
         anchor_id = body.anchorId
+        if parent_id:
+            parent_id = await _resolve_node_id(base_id, parent_id)
+        if anchor_id:
+            anchor_id = await _resolve_node_id(base_id, anchor_id)
         parent_set = "parentId" in body.model_fields_set
         if isinstance(parent_id, str) and isinstance(anchor_id, str):
             raise ApiError(
@@ -564,6 +608,7 @@ class BaseNodeService:
         return updated
 
     async def delete(self, base_id: str, node_id: str, permanent: bool = False) -> dict[str, Any]:
+        node_id = await _resolve_node_id(base_id, node_id)
         node = await repository.get_node_row(node_id)
         if node is None or node["base_id"] != base_id:
             raise _not_found(node_id)
@@ -578,22 +623,40 @@ class BaseNodeService:
                     HttpErrorCode.VALIDATION_ERROR,
                     {"localization": {"i18nKey": "httpErrors.baseNode.cannotDeleteEmptyFolder"}},
                 )
-            await repository.delete_folder_row(base_id, node["resource_id"])
+        await self._delete_node_shares(base_id, node_id)
+        await self._delete_resource(base_id, resource_type, node["resource_id"], permanent)
+        await repository.delete_node_row(node_id)
+        return {"resourceType": resource_type, "resourceId": node["resource_id"]}
+
+    async def _delete_resource(
+        self, base_id: str, resource_type: str, resource_id: str, permanent: bool
+    ) -> None:
+        if resource_type == RESOURCE_FOLDER:
+            await repository.delete_folder_row(base_id, resource_id)
         elif resource_type == TABLE:
             from ..table.service import TableService
 
             if permanent:
-                await TableService().permanent_delete_table(base_id, node["resource_id"])
+                await TableService().permanent_delete_table(base_id, resource_id)
             else:
-                await TableService().delete_table(base_id, node["resource_id"])
+                await TableService().delete_table(base_id, resource_id)
         elif resource_type == DASHBOARD:
             from ..dashboard.service import DashboardService
 
-            await DashboardService().delete_dashboard(base_id, node["resource_id"])
+            await DashboardService().delete_dashboard(base_id, resource_id)
         else:
             raise _invalid_resource_type(resource_type)
-        await repository.delete_node_row(node_id)
-        return {"resourceType": resource_type, "resourceId": node["resource_id"]}
+
+    async def _delete_node_shares(self, base_id: str, node_id: str) -> None:
+        # Ports deleteNodeShares. The base-share list / short-link caches are not
+        # ported (reads hit the row store directly), so nothing to invalidate.
+        from ..base_share import repository as base_share_repository
+        from ..short_link.service import ShortLinkService
+
+        share_ids = await base_share_repository.delete_by_base_node(base_id, node_id)
+        short_link_service = ShortLinkService()
+        for share_id in share_ids:
+            await short_link_service.mark_deleted_by_resource("base-share", share_id)
 
     # -- placement for out-of-band resources (import, table open-api) -------------
 
@@ -768,15 +831,17 @@ async def rename_folder(base_id: str, folder_id: str, name: str) -> dict[str, An
         folder_id, {"name": name, "last_modified_by": cls.get("user.id")}
     )
     if folder is None:
-        raise ApiError(
-            "Folder not found",
-            HttpErrorCode.NOT_FOUND,
-            {"localization": {"i18nKey": "httpErrors.baseNode.folderNotFound"}},
-        )
+        # prisma.baseNodeFolder.update on a missing row throws P2025, which the
+        # global filter surfaces as a bare 500 — not a 404.
+        raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
     return {"id": folder["id"], "name": folder["name"]}
 
 
-async def delete_folder(base_id: str, folder_id: str) -> dict[str, Any] | None:
+async def delete_folder(base_id: str, folder_id: str) -> dict[str, Any]:
     """The folder row only; the node row is reclaimed by the next node-list
-    reconciliation (upstream deletes the node lazily the same way)."""
-    return await repository.delete_folder_row(base_id, folder_id)
+    reconciliation (upstream deletes the node lazily the same way). A missing
+    row makes prisma.baseNodeFolder.delete throw P2025 → bare 500."""
+    deleted = await repository.delete_folder_row(base_id, folder_id)
+    if deleted is None:
+        raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
+    return deleted

@@ -16,6 +16,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 
+from ...core.query import query_list
 from ...core.security.auth import allow_anonymous, auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
@@ -56,7 +57,7 @@ async def list_tables(baseId: str) -> list[dict[str, Any]]:
 @permissions("table|read")
 @allow_anonymous()
 async def socket_snapshot_bulk(baseId: str, request: Request) -> list[dict[str, Any]]:
-    ids = request.query_params.getlist("ids")
+    ids = query_list(request.query_params, "ids")
     return await TableService().socket_snapshot_bulk(baseId, ids)
 
 
@@ -122,7 +123,7 @@ async def permanent_delete_table(baseId: str, tableId: str) -> Response:
 
 
 @router.post("/{tableId}/duplicate", status_code=201)
-@permissions("table|create", "table|read")
+@permissions("table|create")
 async def duplicate_table(baseId: str, tableId: str, request: Request) -> dict[str, Any]:
     body = DuplicateTableBody.zod_validate(await read_json_body(request))
     return await TableService().duplicate_table(baseId, tableId, body.name, body.includeRecords)

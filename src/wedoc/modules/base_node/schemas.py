@@ -83,6 +83,12 @@ class UpdateNodeBody(ZodModel):
             return v
         return _required_name(v)
 
+    @field_validator("icon", mode="before")
+    @classmethod
+    def _icon(cls, v: Any) -> Any:
+        # z.string().trim().optional().nullable(): trim strings, keep null/absent.
+        return v.strip() if isinstance(v, str) else v
+
 
 class MoveNodeBody(ZodModel):
     parentId: ZodNullableStr = None

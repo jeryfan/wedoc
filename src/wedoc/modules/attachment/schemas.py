@@ -2,7 +2,7 @@
 
 from enum import IntEnum
 
-from ...core.validation import ZodModel
+from ...core.validation import ZodEnumInt, ZodModel
 
 
 class UploadType(IntEnum):
@@ -110,9 +110,13 @@ def cache_control(upload_type: int) -> str | None:
     return None
 
 
+# z.nativeEnum(UploadType): a numeric enum, so options list unquoted (1|2|...|20)
+UploadTypeInt = ZodEnumInt([t.value for t in UploadType])
+
+
 class SignatureRo(ZodModel):
     contentType: str
     contentLength: int
     expiresIn: int | None = None
-    type: UploadType
+    type: UploadTypeInt
     baseId: str | None = None

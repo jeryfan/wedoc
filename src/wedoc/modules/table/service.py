@@ -39,7 +39,6 @@ DEFAULT_FIELDS: list[dict[str, Any]] = [
     },
 ]
 DEFAULT_VIEWS: list[dict[str, Any]] = [{"name": "Grid view", "type": "grid", "columnMeta": {}}]
-DEFAULT_RECORDS: list[dict[str, Any]] = [{"fields": {}}, {"fields": {}}, {"fields": {}}]
 
 CELL_VALUE_TYPES = {
     "singleLineText": "string",
@@ -61,7 +60,6 @@ CELL_VALUE_TYPES = {
     "link": "string",
 }
 
-MULTIPLE_CELL_TYPES = {"multipleSelect", "attachment", "user"}
 COMPUTED_FIELD_TYPES = {
     "createdBy",
     "lastModifiedBy",
@@ -70,27 +68,50 @@ COMPUTED_FIELD_TYPES = {
     "autoNumber",
     "formula",
     "rollup",
+    "conditionalRollup",
 }
 
+# db field type (upstream DbFieldType) for a single-value cell. Multi-value
+# cells resolve to JSON via db_field_type() below (isMultipleCellValue -> JSON),
+# so a single user cell is TEXT while a multi user cell is JSON, matching the
+# reference get-db-field-type.
 DB_FIELD_TYPES = {
     "singleLineText": "TEXT",
     "longText": "TEXT",
     "singleSelect": "TEXT",
-    "multipleSelect": "TEXT",
+    "multipleSelect": "JSON",
     "number": "REAL",
     "rating": "REAL",
-    "autoNumber": "REAL",
+    "autoNumber": "INTEGER",
     "checkbox": "BOOLEAN",
     "date": "DATETIME",
     "createdTime": "DATETIME",
     "lastModifiedTime": "DATETIME",
     "createdBy": "TEXT",
     "lastModifiedBy": "TEXT",
-    "user": "JSON",
+    "user": "TEXT",
     "attachment": "JSON",
     "button": "TEXT",
     "link": "JSON",
 }
+
+
+def is_multiple_cell_value(field_type: str, options: dict[str, Any] | None) -> bool:
+    """attachment/multipleSelect are always multi; a user field's multiplicity
+    follows options.isMultiple (default single). Mirrors prepareUserField."""
+    if field_type in ("multipleSelect", "attachment"):
+        return True
+    if field_type == "user":
+        return bool((options or {}).get("isMultiple"))
+    return False
+
+
+def db_field_type(field_type: str, multiple: bool) -> str:
+    """Upstream DbFieldType label: multi-value cells are JSON, else the per-type
+    default. Ports get-db-field-type (isMultipleCellValue -> Json)."""
+    if multiple:
+        return "JSON"
+    return DB_FIELD_TYPES[field_type]
 
 RESERVED_DB_FIELD_NAMES = {
     "__id",
@@ -154,9 +175,9 @@ def _unsupported_field_type(field_type: str) -> ApiError:
 
 def _table_not_found(table_id: str, base_id: str) -> ApiError:
     return ApiError(
-        f"Table not found with id: {table_id}",
+        f"Table {table_id} not found in project {base_id}",
         HttpErrorCode.NOT_FOUND,
-        {"localization": {"i18nKey": "httpErrors.table.notFound"}},
+        {"localization": {"i18nKey": "httpErrors.notFound"}},
     )
 
 
@@ -194,14 +215,10 @@ class TableService:
             [_raw(f) for f in body.fields] if body.fields else [dict(f) for f in DEFAULT_FIELDS]
         )
         view_ros = [_raw(v) for v in body.views] if body.views else [dict(v) for v in DEFAULT_VIEWS]
-        # Match ref createInitialRecords: an explicit empty list creates zero
-        # records; only an omitted (None) records field falls back to the
-        # canonical 3-empty-row default (applied by the public create route).
-        record_ros = (
-            [_raw(r) for r in body.records]
-            if body.records is not None
-            else [dict(r) for r in DEFAULT_RECORDS]
-        )
+        # v2 createTable seeds NO default records (verified against the reference:
+        # a fresh table has rowCount 0). Records are created only when the caller
+        # supplies them (duplicate/import/apply-template pass an explicit list).
+        record_ros = [_raw(r) for r in body.records] if body.records else []
 
         if not any(f.get("isPrimary") for f in field_ros):
             field_ros[0]["isPrimary"] = True
@@ -252,7 +269,11 @@ class TableService:
                 await repository.execute_data_ddl(
                     [
                         ddl.add_field_column_sql(
-                            base_id, table_id, field["dbFieldName"], field["type"]
+                            base_id,
+                            table_id,
+                            field["dbFieldName"],
+                            field["type"],
+                            field["isMultipleCellValue"],
                         )
                     ]
                 )
@@ -268,9 +289,9 @@ class TableService:
                     "name": field["name"],
                     "type": field["type"],
                     "db_field_name": field["dbFieldName"],
-                    "db_field_type": DB_FIELD_TYPES[field["type"]],
+                    "db_field_type": db_field_type(field["type"], field["isMultipleCellValue"]),
                     "cell_value_type": CELL_VALUE_TYPES[field["type"]],
-                    "is_multiple_cell_value": field["type"] in MULTIPLE_CELL_TYPES or None,
+                    "is_multiple_cell_value": field["isMultipleCellValue"] or None,
                     "is_primary": field.get("isPrimary") or None,
                     "not_null": field.get("notNull") or None,
                     "unique": field.get("unique") or False,
@@ -303,6 +324,7 @@ class TableService:
                         "order": float(index),
                         "version": 1,
                         "column_meta": json.dumps(column_meta, separators=(",", ":")),
+                        "created_time": now,
                         "created_by": user_id,
                         "last_modified_time": now,
                         "last_modified_by": user_id,
@@ -358,6 +380,7 @@ class TableService:
                     counter += 1
                 db_field_name = candidate
             seen_db_names.add(db_field_name)
+            options = _normalize_options(field_type, raw.get("options"))
             prepared.append(
                 {
                     "id": raw.get("id") or new_id(IdPrefix.FIELD),
@@ -367,7 +390,8 @@ class TableService:
                     "isPrimary": raw.get("isPrimary") or None,
                     "notNull": raw.get("notNull") or None,
                     "unique": raw.get("unique") or False,
-                    "options": _normalize_options(field_type, raw.get("options")),
+                    "options": options,
+                    "isMultipleCellValue": is_multiple_cell_value(field_type, options),
                 }
             )
         return prepared
@@ -427,6 +451,12 @@ class TableService:
             pending.append({"id": record_id, "fields": vo_fields, "name": name_value})
         await repository.insert_data_rows(base_id, table_id, columns, value_rows)
         if history_rows:
+            # match _write_history: one batch timestamp + ids sorted into insertion
+            # order so the (created_time DESC, id ASC) read is deterministic.
+            created_time = datetime.now(UTC).replace(tzinfo=None)
+            for row, hid in zip(history_rows, sorted(r["id"] for r in history_rows), strict=True):
+                row["created_time"] = created_time
+                row["id"] = hid
             await insert_record_history(history_rows)
         meta = await repository.fetch_data_row_meta(
             base_id, table_id, [record["id"] for record in pending]
@@ -460,9 +490,12 @@ class TableService:
             vo["isPrimary"] = True
         vo["unique"] = bool(field.get("unique"))
         vo["cellValueType"] = CELL_VALUE_TYPES[field["type"]]
-        vo["dbFieldType"] = DB_FIELD_TYPES[field["type"]]
+        multiple = field.get("isMultipleCellValue")
+        if multiple is None:
+            multiple = is_multiple_cell_value(field["type"], field.get("options"))
+        vo["dbFieldType"] = db_field_type(field["type"], multiple)
         vo["type"] = field["type"]
-        if field["type"] in MULTIPLE_CELL_TYPES:
+        if multiple:
             vo["isMultipleCellValue"] = True
         if field["type"] in COMPUTED_FIELD_TYPES:
             vo["isComputed"] = True
@@ -589,7 +622,9 @@ class TableService:
         # v1 route wording/errors (no v2 counterpart).
         candidate = f"{base_id}.{ddl.convert_name_to_valid_character(name, 63)}"
         exist = await repository.find_table_by_db_table_name(candidate, base_id)
-        if exist and exist["id"] != table_id:
+        # ref checks existence without excluding the current row (table-open-api
+        # .service.ts:850-869): renaming a table to its own dbTableName still errors.
+        if exist:
             raise ApiError(
                 f"dbTableName {name} already exists",
                 HttpErrorCode.VALIDATION_ERROR,
@@ -629,7 +664,13 @@ class TableService:
     ) -> None:
         table = await repository.get_table_meta_row(table_id, base_id)
         if table is None:
-            raise _table_not_found(table_id, base_id)
+            # ref order route uses `Table ${tableId} not found` (table-open-api
+            # .service.ts:1006-1017), distinct from the shared not-found wording.
+            raise ApiError(
+                f"Table {table_id} not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.table.notFound"}},
+            )
         anchor = await repository.get_table_meta_row(anchor_id, base_id)
         if anchor is None:
             raise ApiError(
@@ -694,7 +735,9 @@ class TableService:
     async def permanent_delete_table(self, base_id: str, table_id: str) -> None:
         table = await repository.get_table_meta_row(table_id, base_id, include_deleted=True)
         if table is None:
-            raise _table_not_found(table_id, base_id)
+            # ref permanentDeleteTables is best-effort and never asserts existence
+            # (table-open-api.service.ts:533-558): a missing table returns 200.
+            return
         db_table_name = table["db_table_name"]
         table_name = db_table_name.split(".", 1)[1] if "." in db_table_name else db_table_name
         await repository.execute_data_ddl([ddl.drop_data_table_sql(base_id, table_name)])
@@ -735,7 +778,11 @@ class TableService:
             await repository.execute_data_ddl(
                 [
                     ddl.add_field_column_sql(
-                        base_id, new_table_id, field["db_field_name"], field["type"]
+                        base_id,
+                        new_table_id,
+                        field["db_field_name"],
+                        field["type"],
+                        bool(field["is_multiple_cell_value"]),
                     )
                 ]
             )
@@ -782,6 +829,7 @@ class TableService:
                         "order": source_view["order"],
                         "version": 1,
                         "column_meta": json.dumps(column_meta, separators=(",", ":")),
+                        "created_time": now,
                         "created_by": user_id,
                         "last_modified_time": now,
                         "last_modified_by": user_id,
@@ -810,6 +858,7 @@ class TableService:
                 "notNull": f["not_null"],
                 "unique": f["unique"] or False,
                 "options": json.loads(f["options"] or "{}"),
+                "isMultipleCellValue": bool(f["is_multiple_cell_value"]),
             }
             for f in source_fields
         ]
@@ -858,13 +907,15 @@ class TableService:
         """ShareDB table snapshots. See docs/api-parity-ledger.md: the permission
         map and provisionState carry a wider raw shape than the REST table VO and
         are best-effort here (documented gap)."""
-        if not ids:
-            return []
-        rows = {r["id"]: r for r in await repository.list_table_meta_rows(base_id)}
+        rows_list = await repository.list_table_meta_rows(base_id)
+        rows = {r["id"]: r for r in rows_list}
         default_view_ids = await repository.get_default_view_ids(list(rows))
         permission = await self._table_permission_map()
+        # ref findMany uses `id: { in: ids }`; an absent ids query (in: undefined)
+        # returns every table in the base rather than none.
+        target_ids = ids if ids else [r["id"] for r in rows_list]
         snapshots: list[dict[str, Any]] = []
-        for table_id in ids:
+        for table_id in target_ids:
             row = rows.get(table_id)
             if row is None:
                 continue
@@ -898,9 +949,11 @@ class TableService:
         return snapshots
 
     async def _table_permission_map(self) -> dict[str, bool]:
-        granted = cls.get("permissions") or []
+        granted = set(cls.get("permissions") or [])
         actions = _TABLE_PERMISSION_RESOURCES.get("table", [])
-        return {action: (action in set(granted)) for action in actions}
+        # ref getTablePermissionMapByPermissions drops table|create from the snapshot
+        # permission map (table-permission.service.ts:88-92): 10 keys, not 11.
+        return {a: (a in granted) for a in actions if a != "table|create"}
 
 
 def _to_db_value(field: dict[str, Any], value: Any) -> Any:

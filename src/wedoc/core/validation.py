@@ -27,7 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, ValidationError
 
 from .errors import ApiError, HttpErrorCode
 
@@ -93,24 +93,59 @@ def zod_enum_check(value: Any, options: list[str]) -> str:
     return value
 
 
+def zod_enum_check_int(value: Any, options: list[int]) -> int:
+    """z.nativeEnum over a numeric TS enum: options are |-joined unquoted, and any
+    non-matching value (wrong type or out of set) reports the option mismatch."""
+    if isinstance(value, bool) or not isinstance(value, int) or value not in options:
+        joined = "|".join(str(v) for v in options)
+        raise ValueError(f"Invalid option: expected one of {joined}")
+    return value
+
+
 @dataclass(frozen=True)
 class ZodEnumSpec:
     """Annotated metadata carrying a field's zod-enum options."""
 
-    options: tuple[str, ...]
+    options: tuple[Any, ...]
+    quoted: bool = True
+
+
+@dataclass(frozen=True)
+class ZodExpected:
+    """Annotated metadata overriding the zod base-type noun for a field.
+
+    A free-form ``dict`` maps to zod ``record`` by default; a field standing in
+    for a ``z.object()`` needs ``object`` reported on a missing/invalid value.
+    """
+
+    noun: str
 
 
 def ZodEnumStr(options: list[str]) -> Any:
     """Annotated str with zod-enum semantics.
 
-    Present values go through ``zod_enum_check``; absent fields render zod's
-    "Invalid option: expected one of ..." instead of the plain missing-string
-    message (zod reports a missing enum field as an option mismatch).
+    A ``BeforeValidator`` runs ``zod_enum_check`` on the raw input so a present
+    null or wrong-typed value reports "Invalid option: expected one of ..." (as
+    zod does, without type-coercing first) rather than a "received null" string
+    error; absent fields render the same option-mismatch via ``ZodEnumSpec``.
     """
     def check(value: Any) -> str:
         return zod_enum_check(value, list(options))
 
-    return Annotated[str, AfterValidator(check), ZodEnumSpec(tuple(options))]
+    return Annotated[str, BeforeValidator(check), ZodEnumSpec(tuple(options))]
+
+
+def ZodEnumInt(options: list[int]) -> Any:
+    """Annotated int with zod ``nativeEnum`` semantics over a numeric TS enum.
+
+    A ``BeforeValidator`` runs on the raw input so any non-matching value (wrong
+    type or out of set) reports the option mismatch — matching zod, which never
+    coerces — and absent fields render the same unquoted "Invalid option" list.
+    """
+    def check(value: Any) -> int:
+        return zod_enum_check_int(value, list(options))
+
+    return Annotated[int, BeforeValidator(check), ZodEnumSpec(tuple(options), quoted=False)]
 
 
 def zod_int(value: Any) -> int:
@@ -228,7 +263,11 @@ def _resolve_leaf(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> tuple[
 
 def _field_expected(model: type[BaseModel] | None, loc: tuple[Any, ...]) -> str | None:
     """The zod 'expected' noun for a field path: string/number/boolean/array/object."""
-    node, _field = _resolve_leaf(model, loc)
+    node, field = _resolve_leaf(model, loc)
+    if field is not None:
+        for meta in field.metadata:
+            if isinstance(meta, ZodExpected):
+                return meta.noun
     if node is None:
         return None
     if isinstance(node, type):
@@ -291,7 +330,7 @@ def _translate(
     if err_type == "missing":
         spec = _field_enum_spec(model, loc)
         if spec is not None:
-            joined = "|".join(f'"{v}"' for v in spec.options)
+            joined = "|".join(f'"{v}"' if spec.quoted else str(v) for v in spec.options)
             return one(f"Invalid option: expected one of {joined}")
         if _field_nonoptional(model, loc):
             return one("Invalid input: expected nonoptional, received undefined")
@@ -307,7 +346,14 @@ def _translate(
     if err_type in ("list_type", "array_type"):
         return one(f"Invalid input: expected array, received {_parsed_type(input_value)}")
     if err_type in ("dict_type", "model_type", "model_attributes_type"):
-        return one(f"Invalid input: expected object, received {_parsed_type(input_value)}")
+        _node, _field = _resolve_leaf(model, loc)
+        expected = "object"
+        if _field is not None:
+            for meta in _field.metadata:
+                if isinstance(meta, ZodExpected):
+                    expected = meta.noun
+                    break
+        return one(f"Invalid input: expected {expected}, received {_parsed_type(input_value)}")
 
     if err_type == "string_too_short":
         minimum = ctx.get("min_length", 0)
@@ -315,6 +361,12 @@ def _translate(
     if err_type == "string_too_long":
         maximum = ctx.get("max_length", 0)
         return one(f"Too big: expected string to have <={maximum} characters")
+    if err_type == "too_short":
+        minimum = ctx.get("min_length", 0)
+        return one(f"Too small: expected array to have >={minimum} items")
+    if err_type == "too_long":
+        maximum = ctx.get("max_length", 0)
+        return one(f"Too big: expected array to have <={maximum} items")
     if err_type == "greater_than_equal":
         return one(f"Too small: expected number to be >={ctx.get('ge')}")
     if err_type == "less_than_equal":

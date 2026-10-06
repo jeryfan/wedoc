@@ -22,7 +22,7 @@ from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
 from ..collaborator.service import CollaboratorService
 from ..invitation.service import RESOURCE_BASE, InvitationService
-from ..space.schemas import DeleteCollaboratorQuery, UpdateCollaboratorBody
+from ..space.schemas import DeleteCollaboratorQuery
 from .schemas import (
     AddBaseCollaboratorsBody,
     BaseEmailInvitationBody,
@@ -36,6 +36,7 @@ from .schemas import (
     MoveBaseBody,
     PublishBaseBody,
     UpdateBaseBody,
+    UpdateBaseCollaboratorBody,
     UpdateOrderBody,
 )
 from .service import BaseService
@@ -57,7 +58,7 @@ def _dup_sse(events: list[dict[str, Any]]) -> Response:
         content=body,
         media_type="text/event-stream",
         headers=_DUP_SSE_HEADERS,
-        status_code=201,
+        status_code=200,
     )
 
 
@@ -84,9 +85,14 @@ def _empty() -> Response:
 
 def _query_dict(request: Request) -> dict[str, Any]:
     params = dict(request.query_params)
-    # zod array(): a single occurrence arrives as a plain string (rejected by
-    # the schema); repeated keys arrive as an array.
-    if "role" in params:
+    # role is a zod array(): qs turns the bracket form `role[]=` and a repeated
+    # plain key into an array, while a single plain `role=x` stays a scalar the
+    # schema rejects.
+    params.pop("role[]", None)
+    bracket = request.query_params.getlist("role[]")
+    if bracket:
+        params["role"] = bracket
+    elif "role" in params:
         roles = request.query_params.getlist("role")
         params["role"] = roles if len(roles) > 1 else roles[0]
     return params
@@ -110,7 +116,7 @@ async def duplicate_base(request: Request) -> dict[str, Any]:
     )
 
 
-@router.post("/duplicate-stream", status_code=201)
+@router.post("/duplicate-stream", status_code=200)
 @permissions("base|create")
 @resource_meta("spaceId", "body")
 async def duplicate_base_stream(request: Request) -> Response:
@@ -329,7 +335,7 @@ async def add_collaborators(baseId: str, request: Request) -> dict[str, int]:
 
 @router.patch("/{baseId}/collaborators", status_code=200)
 async def update_collaborator(baseId: str, request: Request) -> Response:
-    body = UpdateCollaboratorBody.zod_validate(await read_json_body(request))
+    body = UpdateBaseCollaboratorBody.zod_validate(await read_json_body(request))
     await CollaboratorService().update_collaborator(
         baseId, "base", body.principalId, body.principalType, body.role
     )

@@ -33,7 +33,11 @@ async def api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
 
 async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     if exc.status_code == 404 and exc.detail == "Not Found":
-        message = f"Cannot {request.method} {request.url.path}"
+        # Express `Cannot <METHOD> <originalUrl>` includes the raw query string.
+        target = request.url.path
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        message = f"Cannot {request.method} {target}"
     else:
         message = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
     code = default_code_by_status(exc.status_code)
@@ -131,6 +135,7 @@ def create_app() -> FastAPI:
 
     from .core.middleware import (
         CorsMiddleware,
+        JsonCharsetMiddleware,
         RequestContextMiddleware,
         SecurityHeadersMiddleware,
     )
@@ -138,6 +143,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(CorsMiddleware)
+    app.add_middleware(JsonCharsetMiddleware)
 
     from .modules.auth.router import router as auth_router
     from .modules.auth.social import social_router

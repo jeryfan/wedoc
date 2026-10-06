@@ -93,6 +93,12 @@ AUTOMATION_ACTIONS: tuple[Action, ...] = (
     "automation|update",
 )
 APP_ACTIONS: tuple[Action, ...] = ("app|create", "app|delete", "app|read", "app|update")
+ROUTINE_ACTIONS: tuple[Action, ...] = (
+    "routine|create",
+    "routine|delete",
+    "routine|read",
+    "routine|update",
+)
 USER_ACTIONS: tuple[Action, ...] = ("user|email_read", "user|integrations")
 TABLE_RECORD_HISTORY_ACTIONS: tuple[Action, ...] = ("table_record_history|read",)
 INSTANCE_ACTIONS: tuple[Action, ...] = ("instance|read", "instance|update")
@@ -107,6 +113,7 @@ ALL_ACTIONS: tuple[Action, ...] = (
     *RECORD_ACTIONS,
     *TABLE_RECORD_HISTORY_ACTIONS,
     *AUTOMATION_ACTIONS,
+    *ROUTINE_ACTIONS,
     *APP_ACTIONS,
     *USER_ACTIONS,
     *INSTANCE_ACTIONS,
@@ -330,12 +337,24 @@ _VIEWER_GRANTS: frozenset[Action] = frozenset(
     }
 )
 
+def _with_routine(grants: frozenset[Action]) -> frozenset[Action]:
+    # The enterprise role map grants routine|* to the same roles as automation|*
+    # (routine mirrors the automation action family; it is absent from the OSS
+    # role constants wedoc was ported from).
+    extra: set[Action] = set()
+    if "automation|read" in grants:
+        extra.add("routine|read")
+    if "automation|create" in grants:
+        extra |= {"routine|create", "routine|delete", "routine|update"}
+    return grants | extra
+
+
 ROLE_PERMISSIONS: dict[Role, frozenset[Action]] = {
-    Role.OWNER: _OWNER_GRANTS,
-    Role.CREATOR: _CREATOR_GRANTS,
-    Role.EDITOR: _EDITOR_GRANTS,
-    Role.COMMENTER: _COMMENTER_GRANTS,
-    Role.VIEWER: _VIEWER_GRANTS,
+    Role.OWNER: _with_routine(_OWNER_GRANTS),
+    Role.CREATOR: _with_routine(_CREATOR_GRANTS),
+    Role.EDITOR: _with_routine(_EDITOR_GRANTS),
+    Role.COMMENTER: _with_routine(_COMMENTER_GRANTS),
+    Role.VIEWER: _with_routine(_VIEWER_GRANTS),
 }
 
 # role/template.ts: pure read access + base|query_data
@@ -558,7 +577,7 @@ class PermissionService:
             ).mappings().first()
         if not base or (base["deleted_time"] and not include_inactive_resource):
             raise ApiError(
-                "Base not found",
+                "Project not found",
                 HttpErrorCode.NOT_FOUND,
                 {"localization": {"i18nKey": "httpErrors.base.notFound"}},
             )
@@ -594,8 +613,8 @@ class PermissionService:
                 base_id = space_id = None
         if not space_id or not base_id:
             raise ApiError(
-                f"Invalid tableId: {table_id}",
-                HttpErrorCode.NOT_FOUND,
+                "Table ID does not exist",
+                HttpErrorCode.RESTRICTED_RESOURCE,
                 {"localization": {"i18nKey": "httpErrors.table.notFound"}},
             )
         cls.set("spaceId", space_id)
@@ -748,7 +767,11 @@ class PermissionService:
             return await self.get_permission_by_base_id(resource_id, include_inactive_resource)
         if resource_id.startswith(IdPrefix.TABLE):
             return await self._get_permission_by_table_id(resource_id, include_inactive_resource)
-        raise ApiError("Request path is not valid", HttpErrorCode.RESTRICTED_RESOURCE)
+        raise ApiError(
+            "Request path is not valid",
+            HttpErrorCode.RESTRICTED_RESOURCE,
+            {"localization": {"i18nKey": "httpErrors.permission.invalidRequestPath"}},
+        )
 
     async def get_permissions_for(
         self,

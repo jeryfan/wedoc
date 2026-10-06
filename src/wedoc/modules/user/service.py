@@ -1,6 +1,7 @@
 """UserService port: user CRUD used by both the user and auth modules."""
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -12,6 +13,8 @@ from ...core.ids import IdPrefix, new_id
 from ...core.storage import get_public_full_storage_url, get_storage
 from ..setting import repository as setting_repository
 from . import repository
+
+logger = logging.getLogger(__name__)
 
 AVATAR_BUCKET_DIR = "avatar"
 
@@ -157,6 +160,14 @@ class UserService:
 
     async def update_user_name(self, user_id: str, name: str) -> None:
         await repository.update_user_row(user_id, {"name": name})
+        # Denormalized user cells cache the collaborator title at write time, so a
+        # rename must patch those snapshots or record reads would show stale names.
+        try:
+            fields = await repository.list_user_snapshot_fields(user_id)
+            if fields:
+                await repository.patch_user_snapshot_titles(fields, user_id, name)
+        except Exception:
+            logger.exception("user-rename snapshot propagation failed for %s", user_id)
 
     async def create_system_user(
         self, user_id: str, email: str, name: str

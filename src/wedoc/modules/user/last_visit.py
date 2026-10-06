@@ -1,9 +1,8 @@
 """LastVisitService port: visit resolution and history writes.
 
 Raw-SQL shaped queries follow the upstream knex builders 1:1, including its
-quirks (no ordering in the visit lookups, deleted-table tolerance in the CTE,
-500 on the workflow/app resource types whose prisma models do not exist at
-this baseline).
+quirks (no ordering in the visit lookups, deleted-table tolerance in the CTE).
+The workflow/app/routine resource types resolve to an empty last-visit (200).
 """
 
 from typing import Any
@@ -44,10 +43,10 @@ class LastVisitService:
                 return await self.view_visit(user_id, parent_resource_id)
             case "dashboard":
                 return await self.dashboard_visit(user_id, parent_resource_id)
-            case "workflow" | "app":
-                # prisma has no workflow/app models at this baseline: the
-                # upstream access throws and the global filter answers 500
-                raise RuntimeError(f"prisma.{resource_type} is not a model")
+            case "workflow" | "app" | "routine":
+                # EE resolves these to an empty last-visit (no such visit rows at
+                # this baseline) -> 200 with no body, same as an unrecorded space.
+                return None
             case _:
                 raise ApiError(
                     "Invalid resource type",

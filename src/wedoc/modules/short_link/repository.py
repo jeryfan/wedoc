@@ -1,5 +1,6 @@
 """Short-link persistence — raw-row access for the short-link service."""
 
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -39,6 +40,18 @@ async def base_share_exists(share_id: str) -> bool:
     return row is not None
 
 
+async def base_share_target(share_id: str) -> dict[str, Any] | None:
+    async with db_engine.session() as session:
+        row = (
+            await session.execute(
+                select(BaseShare.base_id, BaseShare.node_id).where(
+                    BaseShare.share_id == share_id, BaseShare.enabled.is_(True)
+                )
+            )
+        ).first()
+    return {"baseId": row[0], "nodeId": row[1]} if row else None
+
+
 async def template_published(template_id: str) -> bool:
     async with db_engine.session() as session:
         row = (
@@ -75,6 +88,20 @@ async def find_by_code(code: str) -> dict[str, Any] | None:
             )
         ).first()
     return {"code": row[0], "type": row[1], "resourceId": row[2]} if row else None
+
+
+async def mark_deleted_by_resource(link_type: str, resource_id: str) -> None:
+    async with db_engine.session() as session:
+        await session.execute(
+            ShortLink.__table__.update()
+            .where(
+                ShortLink.type == link_type,
+                ShortLink.resource_id == resource_id,
+                ShortLink.deleted_time.is_(None),
+            )
+            .values(deleted_time=datetime.now(UTC).replace(tzinfo=None))
+        )
+        await session.commit()
 
 
 async def _reuse_existing(link_type: str, resource_id: str) -> str | None:

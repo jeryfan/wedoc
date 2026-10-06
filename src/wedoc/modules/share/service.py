@@ -310,6 +310,7 @@ class ShareService:
             projection=projection,
             filter_param=query.get("filter"),
             order_by=query.get("orderBy"),
+            group_by=query.get("groupBy") or view.get("group"),
             search=query.get("search"),
             take=query.get("take") or 100,
             skip=query.get("skip") or 0,
@@ -317,7 +318,7 @@ class ShareService:
 
     # -- aggregations ----------------------------------------------------------
     async def get_view_aggregations(
-        self, share_info: dict[str, Any], field_stats, filter_param
+        self, share_info: dict[str, Any], field_stats, filter_param, group_by=None, search=None
     ) -> dict[str, Any]:
         if not (share_info.get("shareMeta") or {}).get("includeRecords"):
             return {"aggregations": []}
@@ -329,14 +330,14 @@ class ShareService:
             field_stats=field_stats,
             filter_param=filter_param,
             tql=None,
-            search=None,
+            search=search,
             view_id=share_info["view"]["id"],
-            group_by=None,
+            group_by=group_by,
             ignore_view_query=False,
         )
 
     async def get_view_row_count(
-        self, share_info: dict[str, Any], filter_param
+        self, share_info: dict[str, Any], filter_param, search=None, selected_record_ids=None
     ) -> dict[str, Any]:
         if not (share_info.get("shareMeta") or {}).get("includeRecords"):
             return {"rowCount": 0}
@@ -344,9 +345,12 @@ class ShareService:
             share_info["tableId"],
             filter_param=filter_param,
             tql=None,
-            search=None,
+            search=search,
             view_id=share_info["view"]["id"],
-            selected_record_ids=None,
+            selected_record_ids=selected_record_ids,
+            filter_link_cell_candidate=None,
+            filter_link_cell_selected=None,
+            projection=None,
             ignore_view_query=False,
         )
 
@@ -487,7 +491,7 @@ class ShareService:
             raise ApiError(
                 "fieldId is required",
                 HttpErrorCode.VALIDATION_ERROR,
-                {"localization": {"i18nKey": "httpErrors.share.fieldIdRequired"}},
+                {"domainCode": "view_collaborators.field_required", "domainTags": ["validation"]},
             )
         self._precheck_field_hidden(share_info, field_id)
         from ..field import repository as field_repository
@@ -586,7 +590,7 @@ class ShareService:
 
     # -- socket ----------------------------------------------------------------
     async def get_view_snapshot_bulk(
-        self, share_info: dict[str, Any], ids: list[str], single: bool
+        self, share_info: dict[str, Any], ids: list[str] | str | None
     ) -> list[dict[str, Any]]:
         from ..view.service import ViewService
 
@@ -597,18 +601,12 @@ class ShareService:
                 HttpErrorCode.NOT_FOUND,
                 {"localization": {"i18nKey": "httpErrors.view.notFound"}},
             )
-        # Upstream reads ids via @Query('ids'): a single ?ids= value arrives as a
-        # string, so ids.length is the string length (>1) and the guard rejects
-        # it. Only the ids[]=/repeated-array form with exactly [view.id] passes.
+        # Upstream reads ids via @Query('ids'): the qs bracket/repeated form is an
+        # array, a single plain ?ids= is a string (whose .length is its character
+        # count, never 1 for a real id). Only the array form holding exactly the
+        # shared view id is allowed to subscribe.
         view_id = view["id"]
-        denied = False
-        if single:
-            value = ids[0] if ids else ""
-            if len(value) > 1 or value != view_id:
-                denied = True
-        elif len(ids) > 1 or (ids and ids[0] != view_id):
-            denied = True
-        if denied:
+        if not (isinstance(ids, list) and len(ids) == 1 and ids[0] == view_id):
             raise ApiError(
                 "View permission not allowed: read",
                 HttpErrorCode.RESTRICTED_RESOURCE,

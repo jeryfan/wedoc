@@ -43,11 +43,15 @@ class Evaluator:
         dependencies: dict[str, dict[str, Any]],
         record_fields: dict[str, Any] | None,
         timezone: str = "UTC",
+        record_id: str | None = None,
+        auto_number: int | None = None,
     ) -> None:
         self.dependencies = dependencies
         self.record_fields = record_fields
         self.has_record = record_fields is not None
         self.timezone = timezone
+        self.record_id = record_id
+        self.auto_number = auto_number
 
     def visit(self, node: Node) -> TypedValue:
         if isinstance(node, Num):
@@ -253,6 +257,8 @@ class Evaluator:
             "record_fields": self.record_fields,
             "dependencies": self.dependencies,
             "timeZone": self.timezone,
+            "record_id": self.record_id,
+            "auto_number": self.auto_number,
         }
         value = func.eval(params, ctx)
         return TypedValue(value, type_, bool(is_multiple))
@@ -272,13 +278,15 @@ def evaluate(
     dependencies: dict[str, dict[str, Any]],
     record_fields: dict[str, Any],
     timezone: str = "UTC",
+    record_id: str | None = None,
+    auto_number: int | None = None,
 ) -> TypedValue:
-    return Evaluator(dependencies, record_fields, timezone).visit(tree)
+    return Evaluator(
+        dependencies, record_fields, timezone, record_id, auto_number
+    ).visit(tree)
 
 
 def _scalar_cell(value: Any) -> Any:
-    if value is False:
-        return None
     if isinstance(value, FormulaBaseError):
         return None
     if isinstance(value, float):

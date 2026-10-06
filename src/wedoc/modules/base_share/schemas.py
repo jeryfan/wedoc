@@ -4,7 +4,7 @@ from typing import Annotated
 
 from pydantic import AfterValidator, StrictBool
 
-from ...core.validation import ZodModel, ZodNullable
+from ...core.validation import ZodExpected, ZodModel, ZodNullable
 
 
 def _share_password(value: str | None) -> str | None:
@@ -27,7 +27,7 @@ class CreateBaseShareRo(ZodModel):
 class CopyBaseShareRo(ZodModel):
     spaceId: str
     name: str | None = None
-    withRecords: bool = True
+    withRecords: Annotated[StrictBool, ZodExpected("boolean")] = True
     baseId: str | None = None
 
 

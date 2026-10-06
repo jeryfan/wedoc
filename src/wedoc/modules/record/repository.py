@@ -202,6 +202,26 @@ async def set_column_values(
         await session.commit()
 
 
+async def shuffle_view_order(base_id: str, table_id: str, column: str) -> None:
+    """Respread a view's row-order column to ROW_NUMBER() over its current order.
+
+    Mirrors the reference shuffleRecords: when the gap between two neighbours is
+    too small to place a record between them, every row is re-indexed by its
+    current order so fresh gaps open up.
+    """
+    table = _q(base_id, table_id)
+    sql = (
+        f"UPDATE {table} SET \"{column}\" = temp_order.new_order FROM ("
+        f'SELECT "__id", ROW_NUMBER() OVER (ORDER BY "{column}" ASC) AS new_order '
+        f"FROM {table}) AS temp_order "
+        f'WHERE {table}."__id" = temp_order."__id" '
+        f'AND {table}."{column}" != temp_order.new_order'
+    )
+    async with db_engine.session() as session:
+        await session.execute(text(sql))
+        await session.commit()
+
+
 async def set_computed_columns(
     base_id: str, table_id: str, record_id: str, values: dict[str, Any]
 ) -> None:
@@ -251,19 +271,17 @@ async def list_ids_linking_to(
 
 
 async def insert_history(rows: list[dict[str, Any]]) -> None:
-    # one commit per row: created_time comes from clock_timestamp() so rows
-    # written in the same request keep distinct millisecond timestamps, which
-    # is what the DESC ordering observed on the reference implementation
-    # relies on.
+    # one batch per update: every row shares the caller-provided created_time so
+    # the entries of a multi-field update carry the same timestamp (ref parity).
     sql = (
         'INSERT INTO "record_history" ("id", "table_id", "record_id", "field_id", '
         '"before", "after", "created_time", "created_by") VALUES '
-        "(:id, :table_id, :record_id, :field_id, :before, :after, clock_timestamp(), :created_by)"
+        "(:id, :table_id, :record_id, :field_id, :before, :after, :created_time, :created_by)"
     )
-    for row in rows:
-        async with db_engine.session() as session:
+    async with db_engine.session() as session:
+        for row in rows:
             await session.execute(text(sql), row)
-            await session.commit()
+        await session.commit()
 
 
 async def list_history(
@@ -297,13 +315,13 @@ async def list_history(
     if cursor_time and cursor_id:
         clauses.append(
             '("created_time" < CAST(:cursor_time AS timestamp) OR '
-            '("created_time" = CAST(:cursor_time AS timestamp) AND "id" < :cursor_id))'
+            '("created_time" = CAST(:cursor_time AS timestamp) AND "id" > :cursor_id))'
         )
         params["cursor_time"] = cursor_time
         params["cursor_id"] = cursor_id
     sql = (
         f'SELECT * FROM "record_history" WHERE {" AND ".join(clauses)} '
-        'ORDER BY "created_time" DESC, "id" DESC LIMIT :limit'
+        'ORDER BY "created_time" DESC, "id" ASC LIMIT :limit'
     )
     params["limit"] = limit
     async with db_engine.session() as session:

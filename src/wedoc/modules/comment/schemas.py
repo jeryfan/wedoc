@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, Field
 
-from ...core.validation import ZodModel, ZodMultiError
+from ...core.validation import ZodModel, ZodMultiError, ZodNullableStr
 
 # zod v4 .emoji(): ^(\p{Extended_Pictographic}|\p{Emoji_Component})+$ — Python's
 # stdlib re has no \p{} support, so approximate with the common emoji codepoint
@@ -99,7 +99,7 @@ BlockContent = Annotated[
 
 
 class CreateCommentRo(ZodModel):
-    quoteId: str | None = None
+    quoteId: ZodNullableStr = None
     content: list[BlockContent]
 
 

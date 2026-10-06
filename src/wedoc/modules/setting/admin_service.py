@@ -66,19 +66,25 @@ class AdminService:
         from ..notification.service import NotificationService
 
         from_user_id = cls.get("user.id") or "system"
-        user_ids = list(ro.userIds or [])
-        if ro.emails:
-            user_ids.extend(await notif_repo.get_user_ids_by_emails(ro.emails))
+        ids = list(ro.userIds or [])
+        emails = list(ro.emails or [])
+        to_users = await notif_repo.get_users_by_ids_or_emails(ids, emails)
+
+        result: dict[str, Any] = {"sentCount": len(to_users)}
+        if ids:
+            resolved_ids = {u["id"] for u in to_users}
+            result["invalidUserIds"] = [uid for uid in ids if uid not in resolved_ids]
+        if emails:
+            resolved_emails = {u["email"].lower() for u in to_users}
+            result["invalidEmails"] = [e for e in emails if e.lower() not in resolved_emails]
+
         notifier = NotificationService()
-        sent = 0
-        for user_id in dict.fromkeys(user_ids):
-            notify_id = await notifier.create_and_push(
+        for user in to_users:
+            await notifier.create_and_push(
                 from_user_id=from_user_id,
-                to_user_id=user_id,
+                to_user_id=user["id"],
                 notify_type="adminNotice",
                 message=ro.message,
                 severity=ro.severity,
             )
-            if notify_id:
-                sent += 1
-        return {"sentCount": sent}
+        return result

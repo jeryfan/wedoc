@@ -1,10 +1,10 @@
 """Request schemas for /api/base — field-level ports of packages/openapi/src/base."""
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import field_validator
+from pydantic import Field, StrictBool, field_validator
 
-from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel, ZodNullableStr
+from ...core.validation import ZodEmailStr, ZodEnumStr, ZodExpected, ZodModel, ZodNullableStr
 from ..space.schemas import (
     PRINCIPAL_TYPE_OPTIONS,
     ROLE_OPTIONS,
@@ -13,8 +13,13 @@ from ..space.schemas import (
     _coerce_bool,
 )
 
+# z.boolean().optional(): reject a present non-boolean; absent stays None.
+_StrictBoolOpt = Annotated[StrictBool | None, ZodExpected("boolean")]
+
 BASE_ROLE_OPTIONS = [r for r in ROLE_OPTIONS if r != "owner"]
 BaseRoleStr = ZodEnumStr(BASE_ROLE_OPTIONS)
+# collaborator-get-list roleSchema accepts every role (owner included).
+RoleStr = ZodEnumStr(ROLE_OPTIONS)
 PositionStr = ZodEnumStr(["before", "after"])
 
 
@@ -41,7 +46,7 @@ class MoveBaseBody(ZodModel):
 class DuplicateBaseBody(ZodModel):
     fromBaseId: str
     spaceId: str
-    withRecords: bool | None = None
+    withRecords: _StrictBoolOpt = None
     name: str | None = None
     baseId: str | None = None
     nodes: list[str] | None = None
@@ -52,7 +57,7 @@ class DuplicateBaseBody(ZodModel):
 class CreateFromTemplateBody(ZodModel):
     spaceId: str
     templateId: str
-    withRecords: bool | None = None
+    withRecords: _StrictBoolOpt = None
     baseId: str | None = None
     timeZone: str | None = None
 
@@ -78,13 +83,19 @@ class AddBaseCollaboratorsBody(ZodModel):
     role: BaseRoleStr
 
 
+class UpdateBaseCollaboratorBody(ZodModel):
+    principalId: str
+    principalType: PrincipalTypeStr
+    role: BaseRoleStr
+
+
 class ListBaseCollaboratorQuery(ZodModel):
     includeSystem: bool | None = None
     skip: int | None = None
     take: int | None = None
     search: str | None = None
     type: PrincipalTypeStr | None = None
-    role: list[BaseRoleStr] | None = None
+    role: list[RoleStr] | None = None
 
     @field_validator("includeSystem", mode="before")
     @classmethod
@@ -160,7 +171,7 @@ class BaseInvitationLinkBody(ZodModel):
 
 
 class BaseEmailInvitationBody(ZodModel):
-    emails: list[ZodEmailStr]
+    emails: list[ZodEmailStr] = Field(min_length=1)
     role: BaseRoleStr
 
 

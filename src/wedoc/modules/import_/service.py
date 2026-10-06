@@ -16,6 +16,7 @@ from ...core.cache import get_cache
 from ...core.errors import ApiError, HttpErrorCode
 from ...workers.queue import TaskQueue
 from ..field.service import FieldService
+from ..table import repository as table_repository
 from ..table.service import TableService
 from . import importer
 from .job import latest_job_key, result_manifest_key
@@ -135,6 +136,17 @@ class ImportService:
                     latest_job_key(created["id"]), job_id, _JOB_TTL_SECONDS
                 )
         return results
+
+    async def assert_table_in_base(self, base_id: str, table_id: str) -> None:
+        table = await table_repository.get_table_meta_row(
+            table_id, base_id, include_deleted=True
+        )
+        if table is None:
+            raise ApiError(
+                f"Table {table_id} not found in project {base_id}",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.notFound"}},
+            )
 
     async def inplace_import_table(
         self, base_id: str, table_id: str, ro: InplaceImportOptionRo

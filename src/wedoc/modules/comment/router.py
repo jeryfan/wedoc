@@ -8,10 +8,15 @@ paths win over the generic /:recordId/:commentId matcher.
 """
 
 import json
+import math
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
+from starlette.datastructures import QueryParams
 
+from ...core.errors import ApiError, HttpErrorCode
+from ...core.query import query_array
 from ...core.security.auth import allow_anonymous, auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
@@ -33,6 +38,114 @@ def _json_param(raw: str | None) -> Any:
         return None
 
 
+# Verbatim zod-validation-error output for each getCommentListQueryRoSchema /
+# getRecordsRoSchema failing branch; kept literal so wire messages stay identical.
+_TAKE_NAN_ERROR = 'Invalid input: expected number, received NaN at "take"'
+_TAKE_MIN_ERROR = 'You should at least take 1 record at "take"'
+_TAKE_MAX_ERROR = "Can't take more than 1000 records, please reduce take count at \"take\""
+_SKIP_NAN_ERROR = 'Invalid input: expected number, received NaN at "skip"'
+_SKIP_MIN_ERROR = 'You can not skip a negative count of records at "skip"'
+_DIRECTION_ERROR = (
+    'Invalid input: expected "forward" at "direction" or '
+    'Invalid input: expected "backward" at "direction"'
+)
+_INCLUDE_CURSOR_ERROR = (
+    'Invalid input: expected boolean, received string at "includeCursor" or '
+    'Invalid option: expected one of "true"|"false" at "includeCursor"'
+)
+
+# zod coerces take/skip through String(Number(x)); a non-numeric string becomes
+# NaN, which the piped z.number() rejects as invalid_type.
+_JS_NUMBER_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _js_number(raw: str) -> float:
+    text = raw.strip()
+    if not text:
+        return 0.0
+    if not _JS_NUMBER_RE.match(text):
+        return float("nan")
+    return float(text)
+
+
+def _page_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
+
+
+def _validate_take(raw: str, default: int, errors: list[str]) -> int | float:
+    number = _js_number(raw)
+    if math.isnan(number):
+        errors.append(_TAKE_NAN_ERROR)
+        return default
+    if number < 1:
+        errors.append(_TAKE_MIN_ERROR)
+        return default
+    if number > 1000:
+        errors.append(_TAKE_MAX_ERROR)
+        return default
+    return _page_number(number)
+
+
+def _validate_skip(raw: str, errors: list[str]) -> int | float:
+    number = _js_number(raw)
+    if math.isnan(number):
+        errors.append(_SKIP_NAN_ERROR)
+        return 0
+    if number < 0:
+        errors.append(_SKIP_MIN_ERROR)
+        return 0
+    return _page_number(number)
+
+
+def _raise_query_errors(errors: list[str]) -> None:
+    if errors:
+        raise ApiError(
+            "Validation error: " + "; ".join(errors), HttpErrorCode.VALIDATION_ERROR
+        )
+
+
+def _parse_comment_list_query(params: QueryParams) -> dict[str, Any]:
+    errors: list[str] = []
+    take: int | float = 20
+    if "take" in params:
+        take = _validate_take(params["take"], 20, errors)
+    include_cursor = True
+    raw_include_cursor = params.get("includeCursor")
+    if raw_include_cursor is not None:
+        if raw_include_cursor == "true":
+            include_cursor = True
+        elif raw_include_cursor == "false":
+            include_cursor = False
+        else:
+            errors.append(_INCLUDE_CURSOR_ERROR)
+    direction = "forward"
+    raw_direction = params.get("direction")
+    if raw_direction is not None:
+        if raw_direction in ("forward", "backward"):
+            direction = raw_direction
+        else:
+            errors.append(_DIRECTION_ERROR)
+    _raise_query_errors(errors)
+    return {
+        "take": take,
+        "cursor": params.get("cursor"),
+        "direction": direction,
+        "includeCursor": include_cursor,
+    }
+
+
+def _parse_count_pagination(params: QueryParams) -> tuple[int | float, int | float]:
+    errors: list[str] = []
+    take: int | float = 100
+    if "take" in params:
+        take = _validate_take(params["take"], 100, errors)
+    skip: int | float = 0
+    if "skip" in params:
+        skip = _validate_skip(params["skip"], errors)
+    _raise_query_errors(errors)
+    return take, skip
+
+
 @router.get("/{recordId}/count", status_code=200)
 @permissions("record|read")
 @allow_anonymous()
@@ -45,19 +158,18 @@ async def get_record_comment_count(tableId: str, recordId: str) -> dict[str, int
 @allow_anonymous()
 async def get_table_comment_count(tableId: str, request: Request) -> list[dict[str, Any]]:
     params = request.query_params
+    take, skip = _parse_count_pagination(params)
     query: dict[str, Any] = {
         "viewId": params.get("viewId"),
         "filter": _json_param(params.get("filter")),
         "orderBy": _json_param(params.get("orderBy")),
         "groupBy": _json_param(params.get("groupBy")),
         "collapsedGroupIds": _json_param(params.get("collapsedGroupIds")),
-        "search": params.getlist("search") or None,
+        "search": query_array(params, "search", expected="tuple"),
         "ignoreViewQuery": (params.get("ignoreViewQuery") or "").lower() == "true",
+        "take": take,
+        "skip": skip,
     }
-    if "take" in params:
-        query["take"] = int(params["take"])
-    if "skip" in params:
-        query["skip"] = int(params["skip"])
     return await CommentService().get_table_comment_count(tableId, query)
 
 
@@ -98,17 +210,14 @@ async def unsubscribe_comment(tableId: str, recordId: str) -> Response:
 @permissions("record|read")
 @allow_anonymous()
 async def get_comment_list(tableId: str, recordId: str, request: Request) -> dict[str, Any]:
-    params = request.query_params
-    take = int(params["take"]) if params.get("take") else 20
-    cursor = params.get("cursor")
-    direction = params.get("direction") or "forward"
-    include_cursor_raw = params.get("includeCursor")
-    if include_cursor_raw is None:
-        include_cursor = True
-    else:
-        include_cursor = include_cursor_raw != "false"
+    query = _parse_comment_list_query(request.query_params)
     return await CommentService().get_comment_list(
-        tableId, recordId, take, cursor, direction, include_cursor
+        tableId,
+        recordId,
+        query["take"],
+        query["cursor"],
+        query["direction"],
+        query["includeCursor"],
     )
 
 

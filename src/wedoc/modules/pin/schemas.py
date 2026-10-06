@@ -19,6 +19,9 @@ PIN_TYPES = [
     "Workflow",
     "app",
     "App",
+    "routine",
+    "Routine",
+    "chat",
 ]
 PinTypeStr = ZodEnumStr(PIN_TYPES)
 PositionStr = ZodEnumStr(["before", "after"])

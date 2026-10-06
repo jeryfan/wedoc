@@ -1,24 +1,35 @@
 """Request schemas for /api/user — field-level ports of packages/openapi/src/user."""
 
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import StrictBool, field_validator
 
-from ...core.validation import ZodEnumStr, ZodModel
+from ...core.validation import ZodEnumStr, ZodExpected, ZodModel
 
 USER_NAME_MAX_LENGTH = 100
 
-# LastVisitResourceType is a TS string enum, and z.enum(<string enum>) accepts
-# only its values (string enums have no reverse-mapping keys) — the exact set is
-# these 7 lowercase names, ordered as declared.
+# The EE LastVisitResourceType enum's zod schema accepts both the enum values
+# (lowercase) and keys (Capitalized) — 8 names (adds routine over OSS's 7),
+# interleaved lower/Cap per name in declaration order. Only the lowercase forms
+# are service-valid on GET (base + every Capitalized form -> "Invalid resource
+# type"); POST accepts all 16.
 LAST_VISIT_RESOURCE_TYPE_OPTIONS: list[str] = [
     "space",
+    "Space",
     "base",
+    "Base",
     "table",
+    "Table",
     "view",
+    "View",
     "dashboard",
+    "Dashboard",
     "workflow",
+    "Workflow",
     "app",
+    "App",
+    "routine",
+    "Routine",
 ]
 
 LAST_VISIT_RESOURCE_TYPES = set(LAST_VISIT_RESOURCE_TYPE_OPTIONS)
@@ -38,8 +49,8 @@ class UpdateUserNameBody(ZodModel):
 
 
 class UserNotifyMetaBody(ZodModel):
-    email: StrictBool | None = None
-    appBuilderChatIntroDismissed: StrictBool | None = None
+    email: Annotated[StrictBool | None, ZodExpected("boolean")] = None
+    appBuilderChatIntroDismissed: Annotated[StrictBool | None, ZodExpected("boolean")] = None
 
 
 class UpdateUserLangBody(ZodModel):
@@ -48,7 +59,7 @@ class UpdateUserLangBody(ZodModel):
 
 class TrackEventBody(ZodModel):
     event: str
-    properties: dict[str, Any] | None = None
+    properties: Annotated[dict[str, Any] | None, ZodExpected("record")] = None
 
     @field_validator("event")
     @classmethod

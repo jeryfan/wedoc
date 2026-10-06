@@ -251,27 +251,33 @@ async def test_last_visit_flow(client, db):
             params={"resourceType": "banana", "parentResourceId": "x"},
         )
         assert resp.status_code == 400
-        assert resp.json()["message"].startswith(
+        assert resp.json()["message"] == (
             'Validation error: Invalid option: expected one of '
-            '"space"|"base"|"table"|"view"|"dashboard"|"workflow"|"app"'
+            '"space"|"Space"|"base"|"Base"|"table"|"Table"|"view"|"View"|'
+            '"dashboard"|"Dashboard"|"workflow"|"Workflow"|"app"|"App"|'
+            '"routine"|"Routine" at "resourceType"'
         )
 
-        # capitalized values are rejected at the schema layer: the upstream
-        # z.enum(LastVisitResourceType) accepts only the lowercase ResourceType
-        # values, so a PascalCase resourceType is a zod validation error.
+        # the EE enum accepts both lowercase values and Capitalized keys; the
+        # Capitalized forms (and "base") pass zod but the service rejects them.
         resp = await client.get(
             "/api/user/last-visit",
             params={"resourceType": "Space", "parentResourceId": "x"},
         )
         assert resp.status_code == 400
-        assert resp.json()["code"] == "validation_error"
-        assert '"Space"' not in resp.json()["message"]
+        assert resp.json()["message"] == "Invalid resource type"
+        assert (
+            resp.json()["data"]["localization"]["i18nKey"]
+            == "httpErrors.lastVisit.invalidResourceType"
+        )
 
+        # workflow/app/routine resolve to an empty last-visit (200)
         resp = await client.get(
             "/api/user/last-visit",
             params={"resourceType": "workflow", "parentResourceId": "x"},
         )
-        assert resp.status_code == 500
+        assert resp.status_code == 200
+        assert resp.content == b""
     finally:
         await db.execute("DELETE FROM user_last_visit WHERE user_id=$1", user_id)
         await db.execute("DELETE FROM view WHERE id IN ('viwT2a','viwT2b')")

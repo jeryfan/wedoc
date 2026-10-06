@@ -8,12 +8,12 @@ slice; link/lookup dependent routes stay empty until link fields exist.
 import json
 import math
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
-from ...core.ids import IdPrefix, new_id
+from ...core.ids import IdPrefix, is_valid_prefixed_id, new_id
 from ...db import provider as ddl
 from ...formula import (
     FormulaError,
@@ -24,7 +24,7 @@ from ...formula import (
     parse as parse_formula,
 )
 from ..table import repository as table_repository
-from ..table.service import CELL_VALUE_TYPES, COMPUTED_FIELD_TYPES, DB_FIELD_TYPES
+from ..table.service import CELL_VALUE_TYPES, COMPUTED_FIELD_TYPES, db_field_type
 from . import link_field, repository
 from .schemas import DuplicateFieldBody, FieldConvertBody, FieldCreateBody, FieldPatchBody
 
@@ -131,6 +131,141 @@ def _js_round(value: float) -> int:
     return math.floor(value + 0.5)
 
 
+# field-converting basalConvert skips the cell migration when the old/new pair is
+# a same-cellValueType, single-value, non-JSON scalar with an identical db type
+# (excluding a longText source and a rating target); the stored column carries
+# over verbatim. Select/user/link targets are dispatched elsewhere and never skip.
+_BASAL_SKIP_TARGETS = {"singleLineText", "longText", "number", "checkbox", "date"}
+
+
+def _basal_convert_skip(
+    old_field: dict[str, Any], target: str, new_options: dict[str, Any]
+) -> bool:
+    if target not in _BASAL_SKIP_TARGETS:
+        return False
+    old_type = old_field["type"]
+    if old_type == "longText":
+        return False
+    # computed/lookup sources keep their dedicated migration path.
+    if old_field.get("is_computed") or old_field.get("is_lookup"):
+        return False
+    # user (and other collaborator-ish) cells are JSON-serialized inside a TEXT
+    # column, so their stored bytes are not a plain-text value and cannot carry
+    # over verbatim -- they must go through cellValue2String (title extraction).
+    if old_type in ("user", "createdBy", "lastModifiedBy", "button"):
+        return False
+    if CELL_VALUE_TYPES.get(old_type) != CELL_VALUE_TYPES.get(target):
+        return False
+    old_multiple = bool(old_field.get("is_multiple_cell_value"))
+    new_multiple = _multiple_cell_value(target, new_options)
+    if old_multiple or new_multiple:
+        return False
+    old_db = db_field_type(old_type, old_multiple)
+    new_db = db_field_type(target, new_multiple)
+    if old_db == "JSON" or new_db == "JSON" or old_db != new_db:
+        return False
+    return True
+
+
+async def _cast_convert_strings(
+    target: str,
+    new_options: dict[str, Any],
+    strings: list[str],
+    table_id: str,
+    field_id: str,
+) -> list[Any]:
+    """Port field-converting's per-target ``convertStringToCellValue`` over a
+    column of stringified old cells. Select targets auto-create choices."""
+    from ..selection.typecast import (
+        FieldTypecaster,
+        _date_convert,
+        parse_string_to_number,
+    )
+
+    if target in ("singleSelect", "multipleSelect"):
+        caster = FieldTypecaster({"id": field_id, "type": target, "options": new_options})
+        cast = caster.cast(strings)
+        await caster.flush_new_choices(table_id)
+        return cast
+    if target == "singleLineText":
+        # newline/tab folded to a space; empty -> null; no surrounding trim.
+        return [re.sub(r"[\n\r\t]", " ", s) or None for s in strings]
+    if target == "longText":
+        return [s or None for s in strings]
+    if target == "number":
+        fmt = (new_options or {}).get("formatting")
+        return [parse_string_to_number(s, fmt) for s in strings]
+    if target == "rating":
+        mx = int((new_options or {}).get("max") or 10)
+        out: list[Any] = []
+        for s in strings:
+            num = parse_string_to_number(s, None)
+            if num is None:
+                out.append(None)
+                continue
+            rounded = min(_js_round(num), mx)
+            out.append(rounded if rounded >= 1 else None)
+        return out
+    if target == "checkbox":
+        return [True if s else None for s in strings]
+    if target in ("date", "createdTime", "lastModifiedTime"):
+        return [_date_convert(s) for s in strings]
+    return [s or None for s in strings]
+
+
+async def _cast_multi_to_single(
+    table_id: str,
+    field_id: str,
+    new_options: dict[str, Any],
+    values: list[Any],
+) -> list[Any]:
+    """multipleSelect -> singleSelect: each cell collapses to its first member,
+    while every distinct member across the column is registered as a choice."""
+    from ..selection.typecast import FieldTypecaster
+
+    caster = FieldTypecaster({"id": field_id, "type": "singleSelect", "options": new_options})
+    seen: list[str] = []
+    for value in values:
+        for name in value if isinstance(value, list) else []:
+            if name not in seen:
+                seen.append(name)
+    caster._pending_choice_names = seen
+    await caster.flush_new_choices(table_id)
+    return [
+        (value[0] if isinstance(value, list) and value else None) for value in values
+    ]
+
+
+def _as_utc_datetime(value: Any) -> datetime:
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(
+        str(value).replace("Z", "+00:00")
+    )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _pg_timestamptz_text(value: Any) -> str:
+    """Render a stored date the way PostgreSQL casts timestamptz to text (the
+    reference converts a date column to text/select via that db cast): a UTC
+    ``YYYY-MM-DD HH:MM:SS[.ffffff]+00`` with trailing fractional zeros trimmed."""
+    dt = _as_utc_datetime(value)
+    text = dt.strftime("%Y-%m-%d %H:%M:%S")
+    if dt.microsecond:
+        text += "." + f"{dt.microsecond:06d}".rstrip("0")
+    return text + "+00"
+
+
+def _date_epoch_ms(value: Any) -> int:
+    return int(_as_utc_datetime(value).timestamp() * 1000)
+
+
+def _epoch_ms_to_datetime(value: Any) -> datetime:
+    """number/rating -> date: the reference reads the numeric value as epoch
+    milliseconds (inverse of date -> number)."""
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=float(value))
+
+
 def _link_cell_title(value: Any) -> str | None:
     """Denormalized link cell ({id,title} or a list) rendered as a title string."""
     if value is None:
@@ -156,11 +291,33 @@ def _field_not_found(field_id: str) -> ApiError:
     return ApiError(f"Field {field_id} not found", HttpErrorCode.NOT_FOUND)
 
 
+def _require_field_id(field_id: str) -> None:
+    if not is_valid_prefixed_id(field_id, "fld", allow_suffix=True):
+        raise ApiError(
+            "Invalid FieldId",
+            HttpErrorCode.VALIDATION_ERROR,
+            {"domainCode": "validation.invalid", "domainTags": ["validation"]},
+        )
+
+
 def _field_not_found_plain() -> ApiError:
     return ApiError(
         "Field not found",
         HttpErrorCode.NOT_FOUND,
         {"domainCode": "not_found", "domainTags": ["not-found"]},
+    )
+
+
+def _field_not_found_in_table(table_id: str, field_id: str) -> ApiError:
+    return ApiError(
+        f"Field {field_id} not found in table {table_id}",
+        HttpErrorCode.NOT_FOUND,
+        {
+            "localization": {
+                "i18nKey": "httpErrors.field.notFoundInTable",
+                "context": {"tableId": table_id, "fieldId": field_id},
+            }
+        },
     )
 
 
@@ -317,6 +474,71 @@ def _rollup_return_type(
     return ("string", False)
 
 
+# rollup / conditionalRollup expression enum (rollup-option.schema ROLLUP_FUNCTIONS).
+ROLLUP_FUNCTIONS = (
+    "countall({values})",
+    "counta({values})",
+    "count({values})",
+    "sum({values})",
+    "average({values})",
+    "max({values})",
+    "min({values})",
+    "and({values})",
+    "or({values})",
+    "xor({values})",
+    "array_join({values})",
+    "array_unique({values})",
+    "array_compact({values})",
+    "concatenate({values})",
+)
+
+# ref conditional.constants CONDITIONAL_QUERY_MAX_LIMIT default.
+CONDITIONAL_QUERY_MAX_LIMIT = 5000
+
+
+def _extract_filter_field_ids(filter_obj: Any) -> list[str]:
+    # ports extractFieldIdsFromFilter: the condition fieldIds reachable in the
+    # (possibly nested) filterSet. An empty/absent filter yields [], which the
+    # conditionalRollup guard treats as "no filter".
+    ids: list[str] = []
+
+    def walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        if "fieldId" in node:
+            ids.append(node["fieldId"])
+        elif "filterSet" in node:
+            for item in node.get("filterSet") or []:
+                walk(item)
+
+    walk(filter_obj)
+    return ids
+
+
+def _conditional_rollup_filter_required() -> ApiError:
+    return ApiError(
+        'Validation error: Filter is required when type is conditionalRollup at "options"',
+        HttpErrorCode.VALIDATION_ERROR,
+    )
+
+
+def _rollup_expression_invalid() -> ApiError:
+    joined = "|".join(f'"{fn}"' for fn in ROLLUP_FUNCTIONS)
+    return ApiError(
+        f'Validation error: Invalid option: expected one of {joined} at "options.expression"',
+        HttpErrorCode.VALIDATION_ERROR,
+    )
+
+
+def _conditional_limit_invalid() -> ApiError:
+    return ApiError(
+        f'Validation error: Too big: expected number to be <={CONDITIONAL_QUERY_MAX_LIMIT} '
+        'at "options.limit"',
+        HttpErrorCode.VALIDATION_ERROR,
+    )
+
+
+
 def _derive_db_field_type(field_type: str, cell_value_type: str, is_multiple: bool) -> str:
     # ports get-db-field-type.ts.
     if is_multiple:
@@ -371,6 +593,36 @@ def _symmetric_field_name(base: str, existing: set[str]) -> str:
     return f"{base} (linked {new_id(IdPrefix.FIELD)})"
 
 
+def _invalid_timezone(value: Any) -> ApiError:
+    return ApiError(f"Invalid TimeZone: {value}", HttpErrorCode.VALIDATION_ERROR)
+
+
+_AVAILABLE_TIMEZONES: set[str] | None = None
+
+
+def _canonical_timezone(value: Any) -> str:
+    """Validate/canonicalize a formatting timeZone the way the reference does:
+    a case-insensitive ``utc`` collapses to ``UTC``; anything else must be an
+    exact IANA name, else a 400 ``Invalid TimeZone`` is raised."""
+    global _AVAILABLE_TIMEZONES
+    if not isinstance(value, str):
+        raise _invalid_timezone(value)
+    canonical = "UTC" if value.lower() == "utc" else value
+    if _AVAILABLE_TIMEZONES is None:
+        from zoneinfo import available_timezones
+
+        _AVAILABLE_TIMEZONES = available_timezones()
+    if canonical not in _AVAILABLE_TIMEZONES:
+        raise _invalid_timezone(value)
+    return canonical
+
+
+def _canonicalize_formatting_timezone(options: dict[str, Any]) -> None:
+    formatting = options.get("formatting")
+    if isinstance(formatting, dict) and "timeZone" in formatting:
+        formatting["timeZone"] = _canonical_timezone(formatting["timeZone"])
+
+
 def _normalize_options(field_type: str, options: dict[str, Any] | None) -> dict[str, Any]:
     options = dict(options) if options else {}
     if field_type == "number":
@@ -406,14 +658,90 @@ def _normalize_options(field_type: str, options: dict[str, Any] | None) -> dict[
             "color": options.get("color", "yellowBright"),
             "max": options.get("max", 5),
         }
+    if field_type == "date" and not options:
+        # DateFieldCore.defaultOptions(): applied when the create/convert request
+        # omits options. timeZone mirrors the formula-field convention (UTC).
+        options = {
+            "formatting": {"date": "YYYY-MM-DD", "time": "None", "timeZone": _FORMULA_TIMEZONE}
+        }
+    if field_type in ("createdTime", "lastModifiedTime"):
+        # prepare{Created,LastModified}TimeField: inject the fixed formula
+        # expression and default datetime formatting (timeZone follows the
+        # formula-field UTC convention).
+        options["expression"] = (
+            "CREATED_TIME()" if field_type == "createdTime" else "LAST_MODIFIED_TIME()"
+        )
+        options.setdefault("formatting", _default_formula_formatting("dateTime"))
+    if field_type == "autoNumber":
+        # prepareAutoNumberField: options carry only the AUTO_NUMBER() expression.
+        options["expression"] = "AUTO_NUMBER()"
+    if field_type == "user":
+        # prepareUserField: the type defaults (isMultiple=false, shouldNotify=true)
+        # are merged whether or not options were supplied (verified against the
+        # reference: {isMultiple:true} in -> {isMultiple:true, shouldNotify:true}).
+        options.setdefault("isMultiple", False)
+        options.setdefault("shouldNotify", True)
+        default_value = options.get("defaultValue")
+        if default_value is not None:
+            flat = default_value if isinstance(default_value, list) else [default_value]
+            options = {
+                **options,
+                "defaultValue": flat if options.get("isMultiple") else (flat[0] if flat else None),
+            }
+    if field_type in ("date", "createdTime", "lastModifiedTime"):
+        _canonicalize_formatting_timezone(options)
     return options
+
+
+def _multiple_cell_value(field_type: str, options: dict[str, Any] | None) -> bool:
+    # attachment/multipleSelect are always multi; a user field's multiplicity is
+    # driven by options.isMultiple (default single), mirroring prepareUserField.
+    if field_type in ("multipleSelect", "attachment"):
+        return True
+    if field_type == "user":
+        return bool((options or {}).get("isMultiple"))
+    return False
+
+
+# v2 mapLegacyCreateFieldToV2.getLegacyDefaultCreateFieldName: the name assigned
+# when a create request omits it. link/rollup/conditionalRollup and lookups get
+# no legacy default — those paths derive the name from the source/foreign field.
+_LEGACY_DEFAULT_FIELD_NAMES = {
+    "singleLineText": "Label",
+    "longText": "Notes",
+    "number": "Number",
+    "rating": "Rating",
+    "singleSelect": "Select",
+    "multipleSelect": "Tags",
+    "attachment": "Attachments",
+    "date": "Date",
+    "autoNumber": "ID",
+    "createdTime": "Created Time",
+    "lastModifiedTime": "Last Modified Time",
+    "checkbox": "Done",
+    "button": "Button",
+    "createdBy": "Created By",
+    "lastModifiedBy": "Last Modified By",
+    "formula": "Calculation",
+}
+
+
+def _legacy_default_field_name(body: FieldCreateBody) -> str | None:
+    if body.isLookup:
+        return None
+    if body.type == "user":
+        options = body.options if isinstance(body.options, dict) else {}
+        return "Collaborators" if options.get("isMultiple") is True else "Collaborator"
+    return _LEGACY_DEFAULT_FIELD_NAMES.get(body.type)
 
 
 def _field_vo(row: dict[str, Any]) -> dict[str, Any]:
     vo: dict[str, Any] = {"id": row["id"], "name": row["name"]}
-    if row.get("description") is not None:
+    if row.get("description"):
         vo["description"] = row["description"]
     vo["dbFieldName"] = row["db_field_name"]
+    if row.get("ai_config"):
+        vo["aiConfig"] = json.loads(row["ai_config"])
     if row.get("is_primary"):
         vo["isPrimary"] = True
     if row.get("not_null"):
@@ -426,8 +754,14 @@ def _field_vo(row: dict[str, Any]) -> dict[str, Any]:
         vo["isMultipleCellValue"] = True
     if row["type"] in COMPUTED_FIELD_TYPES or row.get("is_computed"):
         vo["isComputed"] = True
+    if row.get("is_pending"):
+        vo["isPending"] = True
     if row.get("is_lookup"):
         vo["isLookup"] = True
+    if row.get("is_conditional_lookup"):
+        vo["isConditionalLookup"] = True
+    if row.get("has_error"):
+        vo["hasError"] = True
     if row.get("lookup_options"):
         vo["lookupOptions"] = json.loads(row["lookup_options"])
     vo["options"] = json.loads(row["options"] or "{}")
@@ -460,6 +794,7 @@ class FieldService:
         return table
 
     async def _load_field(self, table_id: str, field_id: str) -> dict[str, Any]:
+        _require_field_id(field_id)
         field = await repository.get_field_row(table_id, field_id)
         if field is None:
             raise _field_not_found(field_id)
@@ -521,6 +856,25 @@ class FieldService:
         )
         return vo
 
+    async def _init_view_column_meta(self, table_id: str, field_id: str) -> None:
+        """Port field-creating.service initViewColumnMeta: a new field must be
+        appended to every view's columnMeta on its table (link symmetric fields
+        target the foreign table)."""
+        from ..view.service import ViewService
+
+        await ViewService().add_field_to_column_meta(table_id, field_id)
+
+    async def _init_duplicated_field_view_column_meta(
+        self, table_id: str, field_id: str, source_field_id: str, view_id: str | None
+    ) -> None:
+        """Port field-open-api duplicateField columnMeta placement: the duplicate
+        lands right after its source in the originating view, appended elsewhere."""
+        from ..view.service import ViewService
+
+        await ViewService().add_duplicated_field_to_column_meta(
+            table_id, field_id, source_field_id, view_id
+        )
+
     async def _create_field(self, table_id: str, body: FieldCreateBody) -> dict[str, Any]:
         table = await self._load_table(table_id)
         if body.isLookup:
@@ -529,6 +883,8 @@ class FieldService:
             return await self._create_link_field(table, body)
         if body.type == "rollup":
             return await self._create_rollup_field(table, body)
+        if body.type == "conditionalRollup":
+            return await self._create_conditional_rollup_field(table, body)
         if body.type == "formula":
             return await self._create_formula_field(table, body)
         base_id = table["base_id"]
@@ -538,7 +894,9 @@ class FieldService:
         siblings = await table_repository.list_field_rows(table_id)
         taken_names = {f["name"] for f in siblings}
         taken_db_names = {f["db_field_name"] for f in siblings}
-        name = _dedup_name(body.name, taken_names)
+        name = _dedup_name(
+            body.name or _legacy_default_field_name(body) or body.type, taken_names
+        )
         db_field_name = self._derive_db_field_name(body, name, taken_db_names)
 
         if body.notNull:
@@ -562,16 +920,17 @@ class FieldService:
 
         field_id = body.id or new_id(IdPrefix.FIELD)
         options = _normalize_options(body.type, body.options)
+        multiple = _multiple_cell_value(body.type, options)
         row = {
             "id": field_id,
             "name": name,
             "description": body.description,
             "type": body.type,
             "db_field_name": db_field_name,
-            "db_field_type": DB_FIELD_TYPES[body.type],
+            "db_field_type": db_field_type(body.type, multiple),
             "cell_value_type": CELL_VALUE_TYPES[body.type],
-            "is_multiple_cell_value": body.type in ("multipleSelect", "attachment", "user"),
-            "is_primary": body.isPrimary or None,
+            "is_multiple_cell_value": multiple or None,
+            "is_primary": None,
             "not_null": body.notNull or None,
             "unique": body.unique or False,
             "options": json.dumps(options, separators=(",", ":")),
@@ -582,10 +941,20 @@ class FieldService:
             "last_modified_time": now,
             "last_modified_by": user_id,
         }
-        await table_repository.execute_data_ddl(
-            [ddl.add_field_column_sql(base_id, table_id, db_field_name, body.type)]
-        )
+        column_ddl = [
+            ddl.add_field_column_sql(base_id, table_id, db_field_name, body.type, multiple)
+        ]
+        if body.unique:
+            column_ddl.append(
+                ddl.add_unique_index_sql(base_id, table_id, db_field_name, field_id)
+            )
+        await table_repository.execute_data_ddl(column_ddl)
         await table_repository.insert_field_rows([row])
+        await self._init_view_column_meta(table_id, field_id)
+        # system/computed fields here (createdTime/lastModifiedTime/createdBy/
+        # lastModifiedBy/autoNumber) resolve synchronously at read from the row's
+        # system columns, so unlike lookup/rollup/formula they are never pending;
+        # the VO deliberately omits isPending to match the reference's settled shape.
         return _field_vo(row)
 
     # ---- link fields --------------------------------------------------------
@@ -658,6 +1027,7 @@ class FieldService:
             )
         )
         await table_repository.insert_field_rows([row])
+        await self._init_view_column_meta(table_id, field_id)
 
         if symmetric_field_id is not None:
             await self._create_symmetric_field(
@@ -811,6 +1181,7 @@ class FieldService:
             [ddl.add_column_by_db_type_sql(base_id, table_id, db_field_name, db_field_type)]
         )
         await table_repository.insert_field_rows([row])
+        await self._init_view_column_meta(table_id, field_id)
         vo = _field_vo(row)
         # ref queues async computation and reports the field as pending on create;
         # the value is materialized on read (see record service lookup resolution).
@@ -886,6 +1257,104 @@ class FieldService:
             [ddl.add_column_by_db_type_sql(base_id, table_id, db_field_name, db_field_type)]
         )
         await table_repository.insert_field_rows([row])
+        await self._init_view_column_meta(table_id, field_id)
+        vo = _field_vo(row)
+        vo["isPending"] = True
+        return vo
+
+    async def _create_conditional_rollup_field(
+        self, table: dict[str, Any], body: FieldCreateBody
+    ) -> dict[str, Any]:
+        table_id = table["id"]
+        base_id = table["base_id"]
+        user_id = cls.get("user.id")
+        now = datetime.now(UTC).replace(tzinfo=None)
+        options_ro = dict(body.options or {})
+        expression = options_ro.get("expression")
+        filter_obj = options_ro.get("filter")
+
+        # conditionalRollup carries no link field — the foreign table, looked-up
+        # field and filter all live in options. A filter with no conditions counts
+        # as absent and is rejected first (matching the reference validation order).
+        if not _extract_filter_field_ids(filter_obj):
+            raise _conditional_rollup_filter_required()
+        if expression not in ROLLUP_FUNCTIONS:
+            raise _rollup_expression_invalid()
+        foreign_table_id = options_ro.get("foreignTableId")
+        if not isinstance(foreign_table_id, str) or not foreign_table_id:
+            raise _foreign_table_id_invalid(foreign_table_id)
+        foreign_table = await repository.get_table_meta_by_id(foreign_table_id)
+        if foreign_table is None or foreign_table["deleted_time"] is not None:
+            raise _foreign_tables_not_found([foreign_table_id])
+        foreign_fields = await table_repository.list_field_rows(foreign_table_id)
+        lookup_field_id = options_ro.get("lookupFieldId")
+        source_field = next((f for f in foreign_fields if f["id"] == lookup_field_id), None)
+        if source_field is None:
+            raise _lookup_field_id_invalid(lookup_field_id or "")
+        limit = options_ro.get("limit")
+        if limit is not None and (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit <= 0
+            or limit > CONDITIONAL_QUERY_MAX_LIMIT
+        ):
+            raise _conditional_limit_invalid()
+
+        source_multiple = bool(source_field.get("is_multiple_cell_value"))
+        cell_value_type, is_multiple = _rollup_return_type(
+            expression, source_field["cell_value_type"], source_multiple
+        )
+        options: dict[str, Any] = {"expression": expression}
+        if "timeZone" in options_ro:
+            options["timeZone"] = options_ro["timeZone"]
+        formatting = options_ro.get("formatting", _DEFAULT_FORMATTING.get(cell_value_type))
+        if formatting is not None:
+            options["formatting"] = formatting
+        if options_ro.get("showAs") is not None:
+            options["showAs"] = options_ro["showAs"]
+        if options_ro.get("baseId") is not None:
+            options["baseId"] = options_ro["baseId"]
+        options["foreignTableId"] = foreign_table_id
+        options["lookupFieldId"] = lookup_field_id
+        options["filter"] = filter_obj
+        if options_ro.get("sort") is not None:
+            options["sort"] = options_ro["sort"]
+        if limit is not None:
+            options["limit"] = limit
+
+        db_field_type = _derive_db_field_type("conditionalRollup", cell_value_type, is_multiple)
+        siblings = await table_repository.list_field_rows(table_id)
+        name = _dedup_name(
+            body.name or f"{source_field['name']} conditional rollup",
+            {f["name"] for f in siblings},
+        )
+        db_field_name = self._derive_db_field_name(
+            body, name, {f["db_field_name"] for f in siblings}
+        )
+        field_id = body.id or new_id(IdPrefix.FIELD)
+        row = {
+            "id": field_id,
+            "name": name,
+            "description": body.description,
+            "type": "conditionalRollup",
+            "db_field_name": db_field_name,
+            "db_field_type": db_field_type,
+            "cell_value_type": cell_value_type,
+            "is_multiple_cell_value": is_multiple or None,
+            "is_computed": True,
+            "options": json.dumps(options, separators=(",", ":")),
+            "table_id": table_id,
+            "order": await table_repository.max_field_order(table_id) + 1,
+            "version": 1,
+            "created_by": user_id,
+            "last_modified_time": now,
+            "last_modified_by": user_id,
+        }
+        await table_repository.execute_data_ddl(
+            [ddl.add_column_by_db_type_sql(base_id, table_id, db_field_name, db_field_type)]
+        )
+        await table_repository.insert_field_rows([row])
+        await self._init_view_column_meta(table_id, field_id)
         vo = _field_vo(row)
         vo["isPending"] = True
         return vo
@@ -940,7 +1409,7 @@ class FieldService:
             "cell_value_type": cell_value_type,
             "is_multiple_cell_value": is_multiple or None,
             "is_computed": True,
-            "is_primary": body.isPrimary or None,
+            "is_primary": None,
             "options": json.dumps(options, separators=(",", ":")),
             "table_id": table_id,
             "order": await table_repository.max_field_order(table_id) + 1,
@@ -953,6 +1422,7 @@ class FieldService:
             [ddl.add_column_by_db_type_sql(base_id, table_id, db_field_name, db_field_type)]
         )
         await table_repository.insert_field_rows([row])
+        await self._init_view_column_meta(table_id, field_id)
         vo = _field_vo(row)
         vo["isPending"] = True
         return vo
@@ -991,8 +1461,11 @@ class FieldService:
         # ports field-open-api getFilterLinkRecords: only link/conditionalRollup
         # fields carrying an explicit record-limiting filter return candidates;
         # every other field (and unfiltered link fields) returns [].
+        _require_field_id(field_id)
         await self._load_table(table_id)
-        field = await self._load_field(table_id, field_id)
+        field = await repository.get_field_row(table_id, field_id)
+        if field is None:
+            raise _field_not_found_plain()
         if field["type"] == "link" and not field.get("is_lookup"):
             options = json.loads(field["options"] or "{}")
             filter_obj = options.get("filter")
@@ -1076,7 +1549,18 @@ class FieldService:
         return _field_vo(field)
 
     async def delete_field(self, table_id: str, field_id: str) -> None:
+        _require_field_id(field_id)
         await self._load_table(table_id)
+        vo = await self._soft_delete_field(table_id, field_id)
+        await self._write_field_trash(table_id, [vo])
+
+    async def delete_fields(self, table_id: str, field_ids: list[str]) -> None:
+        await self._load_table(table_id)
+        vos = [await self._soft_delete_field(table_id, field_id) for field_id in field_ids]
+        await self._write_field_trash(table_id, vos)
+
+    async def _soft_delete_field(self, table_id: str, field_id: str) -> dict[str, Any]:
+        # primary-field guard rejects before any tombstone is written.
         field = await repository.get_field_row(table_id, field_id)
         if field is None:
             raise _field_not_found_plain()
@@ -1096,27 +1580,39 @@ class FieldService:
             table_id,
             [{"actionKey": "deleteField", "payload": {"tableId": table_id, "fieldId": field_id}}],
         )
+        vo = _field_vo(field)
         from ..undo_redo.stack import capture_operation
 
         await capture_operation(
             table_id,
-            {
-                "name": "deleteFields",
-                "params": {"tableId": table_id},
-                "result": {"fields": [_field_vo(field)]},
-            },
+            {"name": "deleteFields", "params": {"tableId": table_id}, "result": {"fields": [vo]}},
         )
+        return vo
 
-    async def delete_fields(self, table_id: str, field_ids: list[str]) -> None:
-        await self._load_table(table_id)
-        for field_id in field_ids:
-            await self.delete_field(table_id, field_id)
+    async def _write_field_trash(self, table_id: str, field_vos: list[dict[str, Any]]) -> None:
+        # mirror the reference table_trash field snapshot ({"fields":[...]}), one
+        # row per delete op. the reference also stores deleted record values;
+        # wedoc keeps the physical column + data, so restore only needs the ids.
+        if not field_vos:
+            return
+        from ..trash import repository as trash_repository
+
+        await trash_repository.insert_table_trash(
+            new_id(IdPrefix.OPERATION),
+            table_id,
+            "field",
+            json.dumps({"fields": field_vos}, ensure_ascii=False),
+            cls.get("user.id"),
+        )
 
     async def duplicate_field(
         self, table_id: str, field_id: str, body: DuplicateFieldBody
     ) -> dict[str, Any]:
         table = await self._load_table(table_id)
-        source = await self._load_field(table_id, field_id)
+        _require_field_id(field_id)
+        source = await repository.get_field_row(table_id, field_id)
+        if source is None:
+            raise _field_not_found_plain()
         user_id = cls.get("user.id")
         now = datetime.now(UTC).replace(tzinfo=None)
 
@@ -1146,9 +1642,20 @@ class FieldService:
             "last_modified_by": user_id,
         }
         await table_repository.execute_data_ddl(
-            [ddl.add_field_column_sql(table["base_id"], table_id, db_field_name, source["type"])]
+            [
+                ddl.add_field_column_sql(
+                    table["base_id"],
+                    table_id,
+                    db_field_name,
+                    source["type"],
+                    bool(source["is_multiple_cell_value"]),
+                )
+            ]
         )
         await table_repository.insert_field_rows([row])
+        await self._init_duplicated_field_view_column_meta(
+            table_id, new_id_, field_id, body.viewId
+        )
         from ...realtime.broadcast import broadcast_field_create
 
         await broadcast_field_create(table_id, _field_vo(row))
@@ -1189,16 +1696,7 @@ class FieldService:
         table = await self._load_table(table_id)
         field = await repository.get_field_row(table_id, field_id)
         if field is None:
-            raise ApiError(
-                f"Field {field_id} not found in table {table_id}",
-                HttpErrorCode.NOT_FOUND,
-                {
-                    "localization": {
-                        "i18nKey": "httpErrors.field.notFoundInTable",
-                        "context": {"tableId": table_id, "fieldId": field_id},
-                    }
-                },
-            )
+            raise _field_not_found_in_table(table_id, field_id)
         count = await repository.count_data_rows(table["base_id"], table_id)
         return {
             "graph": self._delete_plan_graph(table_id, table["name"], field),
@@ -1209,6 +1707,7 @@ class FieldService:
     async def plan_convert(
         self, table_id: str, field_id: str, body: FieldConvertBody
     ) -> dict[str, Any]:
+        _require_field_id(field_id)
         table = await self._load_table(table_id)
         field = await repository.get_field_row(table_id, field_id)
         if field is None:
@@ -1226,7 +1725,7 @@ class FieldService:
         table = await self._load_table(table_id)
         field = await repository.get_field_row(table_id, field_id)
         if field is None:
-            raise _field_not_found(field_id)
+            raise _field_not_found_in_table(table_id, field_id)
         if body.dbFieldName is not None and not _DB_FIELD_NAME_RE.match(body.dbFieldName):
             raise _invalid_db_field_name()
 
@@ -1258,13 +1757,14 @@ class FieldService:
         old_db_field_name = field["db_field_name"]
         new_db_field_name = body.dbFieldName or old_db_field_name
         new_options = _normalize_options(body.type, body.options)
+        multiple = _multiple_cell_value(body.type, new_options)
         updates: dict[str, Any] = {
             "type": body.type,
             "name": body.name or field["name"],
             "db_field_name": new_db_field_name,
             "cell_value_type": CELL_VALUE_TYPES[body.type],
-            "db_field_type": DB_FIELD_TYPES[body.type],
-            "is_multiple_cell_value": body.type in ("multipleSelect", "attachment", "user"),
+            "db_field_type": db_field_type(body.type, multiple),
+            "is_multiple_cell_value": multiple or None,
             "options": json.dumps(new_options, separators=(",", ":")),
             "version": field["version"] + 1,
             "last_modified_time": datetime.now(UTC).replace(tzinfo=None),
@@ -1293,7 +1793,7 @@ class FieldService:
                 table_id,
                 old_db_field_name,
                 new_db_field_name,
-                ddl.FIELD_DB_TYPES[body.type],
+                ddl.column_type_for(body.type, multiple),
                 cell_values,
             )
             field = await repository.get_field_row(table_id, field_id) or new_field
@@ -1594,7 +2094,6 @@ class FieldService:
         self, table: dict[str, Any], field: dict[str, Any], body: FieldConvertBody
     ) -> dict[str, Any]:
         from ..record.service import RecordService
-        from ..selection.typecast import FieldTypecaster
 
         table_id = table["id"]
         base_id = table["base_id"]
@@ -1611,23 +2110,14 @@ class FieldService:
                 titles.append((record_id, title))
         new_options = _normalize_options(target, body.options)
         strings = [t for _, t in titles]
-        if target in ("singleLineText", "longText"):
-            cast: list[Any] = [s or None for s in strings]
-        else:
-            caster = FieldTypecaster(
-                {"id": field["id"], "type": target, "options": new_options}
-            )
-            cast = caster.cast(strings)
-            if target == "rating":
-                mx = int(new_options.get("max") or 10)
-                cast = [None if v is None else min(_js_round(v), mx) for v in cast]
-            await caster.flush_new_choices(table_id)
+        cast = await _cast_convert_strings(target, new_options, strings, table_id, field["id"])
         now = datetime.now(UTC).replace(tzinfo=None)
+        multiple = _multiple_cell_value(target, new_options)
         updates = {
             "type": target, "name": body.name or field["name"], "db_field_name": new_db,
             "cell_value_type": CELL_VALUE_TYPES[target],
-            "db_field_type": DB_FIELD_TYPES[target],
-            "is_multiple_cell_value": target in ("multipleSelect", "attachment", "user"),
+            "db_field_type": db_field_type(target, multiple),
+            "is_multiple_cell_value": multiple or None,
             "is_computed": None, "is_lookup": None,
             "lookup_linked_field_id": None, "lookup_options": None,
             "options": json.dumps(new_options, separators=(",", ":")),
@@ -1642,7 +2132,7 @@ class FieldService:
         ]
         await table_repository.execute_data_ddl(ddl.link_relation_teardown_ddl(options))
         await repository.replace_field_column(
-            base_id, table_id, old_db, new_db, ddl.FIELD_DB_TYPES[target], cell_values
+            base_id, table_id, old_db, new_db, ddl.column_type_for(target, multiple), cell_values
         )
         sym_id = options.get("symmetricFieldId")
         if sym_id and options.get("foreignTableId"):
@@ -1680,11 +2170,12 @@ class FieldService:
 
             await RecordService()._materialize_computed(table, fields_now, ids)
             raw_cells = await repository.list_cell_values(base_id, table_id, old_db)
+        multiple = _multiple_cell_value(target, new_options)
         updates = {
             "type": target, "name": body.name or field["name"],
             "db_field_name": new_db, "cell_value_type": CELL_VALUE_TYPES[target],
-            "db_field_type": DB_FIELD_TYPES[target],
-            "is_multiple_cell_value": target in ("multipleSelect", "attachment", "user"),
+            "db_field_type": db_field_type(target, multiple),
+            "is_multiple_cell_value": multiple or None,
             "is_computed": None, "is_lookup": None,
             "lookup_linked_field_id": None, "lookup_options": None,
             "options": json.dumps(new_options, separators=(",", ":")),
@@ -1697,7 +2188,7 @@ class FieldService:
             table_id, field, new_field, target, new_options, raw_cells
         )
         await repository.replace_field_column(
-            base_id, table_id, old_db, new_db, ddl.FIELD_DB_TYPES[target], cell_values,
+            base_id, table_id, old_db, new_db, ddl.column_type_for(target, multiple), cell_values,
         )
         return await repository.get_field_row(table_id, field["id"]) or new_field
 
@@ -1712,16 +2203,29 @@ class FieldService:
     ) -> list[tuple[str, Any]]:
         """Port field-converting's per-record convertCellValue: stringify each
         stored value through the old field, then coerce it into the new type via
-        the shared typecast engine (which also auto-creates select choices)."""
+        the shared per-target ``convertStringToCellValue`` (which also
+        auto-creates select choices)."""
         from ..record.cell_format import cell_value_to_string
         from ..record.service import RecordService
-        from ..selection.typecast import FieldTypecaster
 
+        if target_type == "user":
+            return await self._cast_to_user(table_id, old_field, new_field, new_options, raw_cells)
         if target_type not in _CELL_MIGRATION_TARGETS:
             return []
 
+        # basalConvert skips migration for a same-cellValueType scalar pair; the
+        # stored column carries over verbatim (e.g. singleLineText -> longText).
+        if _basal_convert_skip(old_field, target_type, new_options):
+            return [(record_id, raw) for record_id, raw in raw_cells if raw is not None]
+
+        old_type = old_field["type"]
         ids: list[str] = []
         strings: list[str] = []
+        values: list[Any] = []
+        number_to_select = old_type == "number" and target_type in (
+            "singleSelect",
+            "multipleSelect",
+        )
         for record_id, raw in raw_cells:
             if raw is None:
                 continue
@@ -1729,24 +2233,97 @@ class FieldService:
             if value is None:
                 continue
             ids.append(record_id)
-            strings.append(cell_value_to_string(old_field, value))
+            values.append(value)
+            if number_to_select:
+                # number -> select uses the raw numeric string (full precision,
+                # no formatting), unlike the formatted number -> text migration.
+                strings.append(str(value))
+            else:
+                strings.append(cell_value_to_string(old_field, value))
 
-        if target_type == "longText":
-            # longText keeps interior newlines (its coercion only trims); the
-            # shared caster folds them like singleLineText, so honor it here.
-            cast: list[Any] = [s.strip() or None for s in strings]
-        else:
-            caster = FieldTypecaster(
-                {"id": old_field["id"], "type": target_type, "options": new_options}
+        # value-level cross casts coerce the typed value (not its stringified
+        # form), matching the reference's typed/db cast for these pairs.
+        cast: list[Any] | None = None
+        if old_type == "checkbox" and target_type == "number":
+            cast = [1 for _ in values]
+        elif old_type == "checkbox" and target_type == "rating":
+            rating_max = int((new_options or {}).get("max") or 10)
+            cast = [rating_max for _ in values]
+        elif old_type == "number" and target_type == "checkbox":
+            cast = [True if value else None for value in values]
+        elif old_type == "multipleSelect" and target_type == "singleSelect":
+            cast = await _cast_multi_to_single(table_id, old_field["id"], new_options, values)
+        elif old_type in ("number", "rating") and target_type == "date":
+            cast = [_epoch_ms_to_datetime(value) for value in values]
+        elif old_type == "date" and target_type == "number":
+            cast = [_date_epoch_ms(value) for value in values]
+        elif old_type == "date" and target_type == "rating":
+            # a timestamptz cannot cast to the rating (min 1) domain -> cleared.
+            cast = [None for _ in values]
+        elif old_type == "date" and target_type in ("singleLineText", "longText"):
+            cast = [_pg_timestamptz_text(value) for value in values]
+        elif old_type == "date" and target_type in ("singleSelect", "multipleSelect"):
+            texts = [_pg_timestamptz_text(value) for value in values]
+            cast = await _cast_convert_strings(
+                target_type, new_options, texts, table_id, old_field["id"]
             )
-            cast = caster.cast(strings)
-            if target_type == "rating":
-                max_value = int(new_options.get("max") or 10)
-                cast = [None if v is None else min(_js_round(v), max_value) for v in cast]
-            await caster.flush_new_choices(table_id)
+        if cast is None:
+            cast = await _cast_convert_strings(
+                target_type, new_options, strings, table_id, old_field["id"]
+            )
 
         return [
             (record_id, RecordService._to_db_value(new_field, value))
             for record_id, value in zip(ids, cast, strict=True)
             if value is not None
         ]
+
+    async def _cast_to_user(
+        self,
+        table_id: str,
+        old_field: dict[str, Any],
+        new_field: dict[str, Any],
+        new_options: dict[str, Any],
+        raw_cells: list[tuple[str, Any]],
+    ) -> list[tuple[str, Any]]:
+        """Port field-converting convert2User: stringify each old cell, split on
+        commas, and resolve each token against the base collaborators by an exact
+        id/name/email match (single cells keep only the first token's match)."""
+        from ..collaborator.service import CollaboratorService
+        from ..record.cell_format import cell_value_to_string
+        from ..record.service import RecordService
+
+        table = await self._load_table(table_id)
+        collaborators = await CollaboratorService().get_user_collaborators(
+            table["base_id"], {"take": 1000}
+        )
+        index: dict[str, dict[str, Any]] = {}
+        for user in collaborators:
+            for token in (user.get("id"), user.get("name"), user.get("email")):
+                if token:
+                    index.setdefault(token, user)
+
+        def _match(token: str) -> dict[str, Any] | None:
+            user = index.get(token)
+            if user is None:
+                return None
+            return {"id": user["id"], "title": user.get("name"), "email": user.get("email")}
+
+        multiple = bool((new_options or {}).get("isMultiple"))
+        out: list[tuple[str, Any]] = []
+        for record_id, raw in raw_cells:
+            if raw is None:
+                continue
+            value = RecordService._from_db_value(old_field, raw)
+            if value is None:
+                continue
+            tokens = [t.strip() for t in cell_value_to_string(old_field, value).split(",")]
+            if multiple:
+                matched = [m for t in tokens if (m := _match(t))]
+                cell: Any = matched or None
+            else:
+                cell = _match(tokens[0]) if tokens else None
+            if cell is None:
+                continue
+            out.append((record_id, RecordService._to_db_value(new_field, cell)))
+        return out

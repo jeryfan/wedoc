@@ -1,9 +1,9 @@
 """Base read-only DB connection — ports base/db-connection.service.ts.
 
 Creates a schema-scoped read-only Postgres role for a base and returns its DSN.
-For the single-PG deployment the data database is the meta database; the DSN
-host/port come from PUBLIC_DATABASE_PROXY when set (as upstream), otherwise from
-the meta connection so the returned credentials are directly usable.
+For the single-PG deployment the data database is always the meta-fallback, so a
+readonly DSN is only available when PUBLIC_DATABASE_PROXY is set; without it
+create/retrieve return null (upstream getDefaultReadonlyDsnTarget → available:false).
 """
 
 from typing import Any
@@ -25,15 +25,15 @@ def _quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _readonly_target() -> dict[str, Any]:
+def _readonly_target() -> dict[str, Any] | None:
     settings = get_settings()
+    proxy = settings.public_database_proxy
+    if not proxy:
+        return None
     meta = urlsplit(settings.sqlalchemy_dsn.replace("postgresql+asyncpg://", "postgresql://"))
     database = (meta.path or "").lstrip("/")
-    proxy = settings.public_database_proxy
-    if proxy:
-        parsed = urlsplit(f"https://{proxy}")
-        return {"host": parsed.hostname, "port": parsed.port or 5432, "db": database}
-    return {"host": meta.hostname, "port": meta.port or 5432, "db": database}
+    parsed = urlsplit(f"https://{proxy}")
+    return {"host": parsed.hostname, "port": parsed.port or 5432, "db": database}
 
 
 def _url_from_dsn(dsn: dict[str, Any]) -> str:
@@ -49,6 +49,8 @@ class DbConnectionService:
         role = f"read_only_role_{base_id}"
         password = random_string(21)
         target = _readonly_target()
+        if target is None:
+            return None
         max_conn = settings.default_max_base_db_connections
         async with db_engine.session() as session:
             base = (
@@ -61,7 +63,12 @@ class DbConnectionService:
                 raise ApiError(
                     "Only base owner can create db connection",
                     HttpErrorCode.RESTRICTED_RESOURCE,
-                    {"localization": {"i18nKey": "httpErrors.dbConnection.onlyOwnerCanCreate"}},
+                    {
+                        "localization": {
+                            "i18nKey": "httpErrors.dbConnection.onlyOwnerCanCreate",
+                            "context": {"baseId": base_id},
+                        }
+                    },
                 )
             await session.execute(
                 text("UPDATE base SET schema_pass = :pw WHERE id = :id").bindparams(
@@ -124,7 +131,12 @@ class DbConnectionService:
                 raise ApiError(
                     "Role does not exist",
                     HttpErrorCode.INTERNAL_SERVER_ERROR,
-                    {"localization": {"i18nKey": "httpErrors.dbConnection.roleNotExist"}},
+                    {
+                        "localization": {
+                            "i18nKey": "httpErrors.dbConnection.roleNotExist",
+                            "context": {"role": role},
+                        }
+                    },
                 )
             current = (
                 await session.execute(
@@ -135,6 +147,8 @@ class DbConnectionService:
             ).scalar() or 0
             schema_pass = base[0]
         target = _readonly_target()
+        if target is None:
+            return None
         dsn = {
             "driver": "postgresql",
             "host": target["host"],

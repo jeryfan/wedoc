@@ -43,7 +43,10 @@ def _sse(events: list[dict[str, Any]]) -> Response:
         f"data: {json.dumps(e, ensure_ascii=False, separators=(',', ':'))}\n\n"
         for e in events
     )
-    return Response(content=body, media_type="text/event-stream", headers=_SSE_HEADERS)
+    # the import stream routes are plain @Post (201) in the reference
+    return Response(
+        content=body, status_code=201, media_type="text/event-stream", headers=_SSE_HEADERS
+    )
 
 
 async def _assert_write_target(target_resource_id: str, has_base: bool) -> None:
@@ -84,7 +87,7 @@ async def airtable_analyze(request: Request) -> dict[str, Any]:
         ) from exc
 
 
-@router.post("/import-airtable/stream", status_code=200)
+@router.post("/import-airtable/stream", status_code=201)
 @token_access()
 async def airtable_import_stream(request: Request) -> Response:
     ro = AirtableImportRo.zod_validate(await read_json_body(request))
@@ -94,7 +97,7 @@ async def airtable_import_stream(request: Request) -> Response:
     if not target:
         raise ApiError("Either baseId or spaceId is required.", HttpErrorCode.VALIDATION_ERROR)
     await _assert_write_target(target, bool(ro.baseId))
-    events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = [{"type": "progress", "phase": "fetching_schema"}]
     try:
         await service.airtable_analyze(ro.accessToken, ro.airtableBaseId)
         events.append({"type": "error", "message": service._DEFERRED})
@@ -117,7 +120,7 @@ async def google_analyze(request: Request) -> dict[str, Any]:
         ) from exc
 
 
-@router.post("/import-google-sheet/stream", status_code=200)
+@router.post("/import-google-sheet/stream", status_code=201)
 @token_access()
 async def google_import_stream(request: Request) -> Response:
     ro = GoogleSheetImportRo.zod_validate(await read_json_body(request))
@@ -126,7 +129,7 @@ async def google_import_stream(request: Request) -> Response:
     if not target:
         raise ApiError("Either baseId or spaceId is required.", HttpErrorCode.VALIDATION_ERROR)
     await _assert_write_target(target, bool(ro.baseId))
-    events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = [{"type": "progress", "phase": "fetching_schema"}]
     try:
         await service.google_analyze(ro.accessToken, ro.spreadsheetId)
         events.append({"type": "error", "message": service._DEFERRED})

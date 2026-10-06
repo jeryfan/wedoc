@@ -14,6 +14,8 @@ from decimal import Decimal
 from typing import Any
 
 from ...core.errors import ApiError, HttpErrorCode
+from ...db.provider import parse_db_table_name
+from ..field.repository import get_field_row_by_id
 from ..record.repository import count_rows, list_rows
 from ..record.service import RecordService, _iso
 from ..record.tql import TqlParseError, parse_tql
@@ -73,6 +75,57 @@ def _field_options(field: dict[str, Any]) -> dict[str, Any]:
     if isinstance(options, str):
         return json.loads(options or "{}")
     return options or {}
+
+
+def _field_searchable(field: dict[str, Any], value: str, is_all: bool) -> bool:
+    # ports FieldCore.isSearchable: boolean is never searchable; attachment/button
+    # override to false; in the search-all-fields mode dateTime is skipped and a
+    # number field is skipped when the needle is non-numeric.
+    if field["type"] in ("attachment", "button"):
+        return False
+    cvt = field["cell_value_type"]
+    if cvt == "boolean":
+        return False
+    if is_all:
+        if cvt == "dateTime":
+            return False
+        if cvt == "number":
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                return False
+    return True
+
+
+def _search_text_expr(field: dict[str, Any]) -> str:
+    # per-type text projection the ILIKE runs against (mirrors SearchQueryPostgres):
+    # numbers round to display precision, multi/user/link cells reduce to joined
+    # titles, single user/link to its title, other structured columns cast to text.
+    column = f'"{field["db_field_name"]}"'
+    if field["cell_value_type"] == "number":
+        precision = (_field_options(field).get("formatting") or {}).get("precision", 0)
+        return f"ROUND({column}::numeric, {int(precision)})::text"
+    if field.get("is_multiple_cell_value"):
+        if field["type"] == "multipleSelect":
+            # jsonb array of choice-name strings (no title objects)
+            return (
+                f"(SELECT string_agg(value, ', ') "
+                f"FROM jsonb_array_elements_text({column}::jsonb) AS value)"
+            )
+        if field["db_field_type"] == "JSON":
+            return (
+                f"(SELECT string_agg(elem->>'title', ', ') "
+                f"FROM jsonb_array_elements({column}) AS elem)"
+            )
+        return f"array_to_string({column}, ', ')"
+    if field["type"] == "user":
+        # single user cell is a text column holding one JSON object
+        return f"{column}::jsonb->>'title'"
+    if field["db_field_type"] == "JSON":
+        return f"{column}->>'title'"
+    if field["cell_value_type"] == "dateTime":
+        return f"{column}::text"
+    return column
 
 
 def _field_timezone(field: dict[str, Any]) -> str:
@@ -224,6 +277,14 @@ class AggregationService:
             return {"conjunction": "and", "filterSet": [view_filter, filter_param]}
         return filter_param or view_filter
 
+    def _custom_filter(
+        self, filter_param: dict[str, Any] | None, tql: str | None
+    ) -> dict[str, Any] | None:
+        # TqlPipe assigns the parsed filterByTql to value.filter before the view
+        # merge, so filterByTql replaces the custom filter but is still merged
+        # with the view filter downstream (not a wholesale replacement).
+        return self._parse_tql(tql) if tql else filter_param
+
     def _compile_where(
         self,
         fields: list[dict[str, Any]],
@@ -253,31 +314,34 @@ class AggregationService:
         counter: list[int],
     ) -> str | None:
         # substring search mirroring SearchQueryPostgres: ILIKE with escaped
-        # wildcards; number fields round to their display precision first.
+        # wildcards. An empty/absent field ref (search[1]) searches every
+        # searchable field (getSearchFields isSearchAllFields), not none.
         value = str(search[0])
         escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        refs = str(search[1]).split(",") if len(search) >= 2 and search[1] else []
-        targets = []
-        for ref in refs:
-            field = self._records._resolve_field(fields, ref)
-            if field is not None and field not in targets:
-                targets.append(field)
+        ref = search[1] if len(search) >= 2 else None
+        is_all = not ref
+        targets: list[dict[str, Any]] = []
+        if is_all:
+            targets = [f for f in fields if _field_searchable(f, value, True)]
+        else:
+            for rid in str(ref).split(","):
+                field = self._records._resolve_field(fields, rid)
+                if (
+                    field is not None
+                    and field not in targets
+                    and _field_searchable(field, value, False)
+                ):
+                    targets.append(field)
         if not targets:
-            # an empty or unresolvable field ref selects no search fields, as in
+            # a non-searchable or unresolvable field ref matches nothing, as in
             # getSearchFields; search-count/-index then answer {count: 0} / null.
             return None
         clauses = []
         for field in targets:
-            column = f'"{field["db_field_name"]}"'
-            if field["cell_value_type"] == "number":
-                precision = (_field_options(field).get("formatting") or {}).get("precision", 0)
-                expr = f"ROUND({column}::numeric, {int(precision)})::text"
-            else:
-                expr = column
             param = f"s{counter[0]}"
             counter[0] += 1
             params[param] = f"%{escaped}%"
-            clauses.append(f"{expr} ILIKE :{param} ESCAPE '\\'")
+            clauses.append(f"{_search_text_expr(field)} ILIKE :{param} ESCAPE '\\'")
         return " OR ".join(clauses)
 
     @staticmethod
@@ -347,9 +411,9 @@ class AggregationService:
         ignore_view_query: bool,
     ) -> dict[str, Any]:
         table, fields = await self._load(table_id)
-        filter_obj = await self._merged_filter(table_id, view_id, filter_param, ignore_view_query)
-        if tql:
-            filter_obj = self._parse_tql(tql)
+        filter_obj = await self._merged_filter(
+            table_id, view_id, self._custom_filter(filter_param, tql), ignore_view_query
+        )
 
         statistic_fields: list[tuple[dict[str, Any], str]] = []
         if field_stats:
@@ -528,7 +592,9 @@ class AggregationService:
 
     def _group_order(self, field: dict[str, Any], order: str) -> str:
         direction = "DESC" if order == "desc" else "ASC"
-        nulls = "NULLS LAST" if direction == "DESC" else "NULLS FIRST"
+        # PostgreSQL default null placement (asc -> NULLS LAST, desc -> NULLS FIRST),
+        # matching the reference's group ordering.
+        nulls = "NULLS FIRST" if direction == "DESC" else "NULLS LAST"
         if field["type"] in ("singleSelect", "multipleSelect"):
             choices = _field_options(field).get("choices") or []
             names = [str(choice.get("name")) for choice in choices]
@@ -569,19 +635,161 @@ class AggregationService:
         search: list[Any] | None,
         view_id: str | None,
         selected_record_ids: list[str] | None,
+        filter_link_cell_candidate: list[str] | str | None,
+        filter_link_cell_selected: list[str] | str | None,
+        projection: list[str] | None,
         ignore_view_query: bool,
     ) -> dict[str, Any]:
         table, fields = await self._load(table_id)
-        filter_obj = await self._merged_filter(table_id, view_id, filter_param, ignore_view_query)
-        if tql:
-            filter_obj = self._parse_tql(tql)
-        where_sql, params = self._compile_where(fields, filter_obj, search, exact_only=True)
+        filter_obj = await self._merged_filter(
+            table_id, view_id, self._custom_filter(filter_param, tql), ignore_view_query
+        )
+        where_sql, params = self._compile_where(
+            fields, filter_obj, self._projected_search(fields, search, projection), exact_only=True
+        )
+        counter = [0]
+        # selectedRecordIds restricts the base set: subtracted when listing link
+        # candidates (already-selected rows are excluded), kept otherwise.
         if selected_record_ids:
-            clause = ", ".join(f":sid{i}" for i in range(len(selected_record_ids)))
-            where_sql += f'{" AND" if where_sql else " WHERE"} "__id" IN ({clause})'
+            placeholders = ", ".join(f":sid{i}" for i in range(len(selected_record_ids)))
+            op = "NOT IN" if filter_link_cell_candidate is not None else "IN"
+            where_sql += f'{" AND" if where_sql else " WHERE"} "__id" {op} ({placeholders})'
             params.update({f"sid{i}": rid for i, rid in enumerate(selected_record_ids)})
+
+        if filter_link_cell_candidate is not None:
+            clause = await self._link_candidate_clause(
+                table, filter_link_cell_candidate, params, counter
+            )
+            if clause:
+                where_sql += f'{" AND" if where_sql else " WHERE"} ({clause})'
+
+        if filter_link_cell_selected is not None:
+            row_count = await self._link_selected_row_count(
+                table, filter_link_cell_selected, where_sql, params, counter
+            )
+            return {"rowCount": row_count}
+
         row_count = await count_rows(table["base_id"], table_id, where_sql, params)
         return {"rowCount": row_count}
+
+    def _projected_search(
+        self,
+        fields: list[dict[str, Any]],
+        search: list[Any] | None,
+        projection: list[str] | None,
+    ) -> list[Any] | None:
+        # projection narrows the searchable fields (search-only effect); refs
+        # outside the projection are dropped before the search clause is built.
+        if not search or not projection or len(search) < 2 or not search[1]:
+            return search
+        allowed = set(projection)
+        refs = [
+            ref
+            for ref in str(search[1]).split(",")
+            if (field := self._records._resolve_field(fields, ref)) is not None
+            and field["id"] in allowed
+        ]
+        return [search[0], ",".join(refs), *search[2:]]
+
+    @staticmethod
+    def _is_junction(fk_host_table_name: str) -> bool:
+        _, table = parse_db_table_name(fk_host_table_name)
+        return table.startswith("junction")
+
+    async def _resolve_link_field(
+        self, table: dict[str, Any], raw: list[str] | str
+    ) -> tuple[dict[str, Any], str | None]:
+        field_id = raw[0] if isinstance(raw, list) else raw
+        record_id = raw[1] if isinstance(raw, list) and len(raw) > 1 else None
+        field = await get_field_row_by_id(field_id)
+        if field is None or field["type"] != "link":
+            raise ApiError(
+                f"Field not found: {field_id}",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.field.notFound"}},
+            )
+        options = _field_options(field)
+        if options.get("foreignTableId") != table["id"]:
+            raise ApiError(
+                "Field is not linked to current table",
+                HttpErrorCode.VALIDATION_ERROR,
+                {"localization": {"i18nKey": "httpErrors.field.notLinkedToCurrentTable"}},
+            )
+        return options, record_id
+
+    async def _link_candidate_clause(
+        self,
+        table: dict[str, Any],
+        raw: list[str] | str,
+        params: dict[str, Any],
+        counter: list[int],
+    ) -> str | None:
+        options, record_id = await self._resolve_link_field(table, raw)
+        relationship = options["relationship"]
+        self_key = options["selfKeyName"]
+        foreign_key = options["foreignKeyName"]
+        fk_host = options["fkHostTableName"]
+
+        def bind(value: Any) -> str:
+            name = f"lc{counter[0]}"
+            counter[0] += 1
+            params[name] = value
+            return name
+
+        if relationship in ("oneMany", "oneOne"):
+            junction = self._is_junction(fk_host)
+            if junction or (relationship == "oneOne" and self_key == "__id"):
+                schema, tbl = parse_db_table_name(fk_host)
+                sub = f'SELECT "{foreign_key}" FROM "{schema}"."{tbl}"'
+                conds = [] if junction else [f'"{foreign_key}" IS NOT NULL']
+                if record_id:
+                    conds.append(f'"{self_key}" <> :{bind(record_id)}')
+                if conds:
+                    sub += " WHERE " + " AND ".join(conds)
+                return f'"__id" NOT IN ({sub})'
+            if record_id:
+                return f'("{self_key}" IS NULL OR "{self_key}" = :{bind(record_id)})'
+            return f'"{self_key}" IS NULL'
+        return None
+
+    async def _link_selected_row_count(
+        self,
+        table: dict[str, Any],
+        raw: list[str] | str,
+        where_sql: str,
+        params: dict[str, Any],
+        counter: list[int],
+    ) -> int:
+        options, record_id = await self._resolve_link_field(table, raw)
+        self_key = options["selfKeyName"]
+        foreign_key = options["foreignKeyName"]
+        fk_host = options["fkHostTableName"]
+
+        def bind(value: Any) -> str:
+            name = f"ls{counter[0]}"
+            counter[0] += 1
+            params[name] = value
+            return name
+
+        if fk_host != table["db_table_name"]:
+            # The foreign key lives on a junction / the linking table: count the
+            # relation rows that point at a current-table row passing the filter
+            # (mirrors the reference left-join + count, which counts link pairs).
+            schema, tbl = parse_db_table_name(fk_host)
+            inner = f'SELECT "__id" FROM {self._table_ref(table)}{where_sql}'
+            clause = f'"{foreign_key}" IN ({inner})'
+            if record_id:
+                clause += f' AND "{self_key}" = :{bind(record_id)}'
+            rows = await repository.raw_rows(
+                f'SELECT count(*) AS count FROM "{schema}"."{tbl}" WHERE {clause}', params
+            )
+            return int(rows[0]["count"]) if rows else 0
+        # The self key lives on the current table: a plain column predicate.
+        if record_id:
+            where_sql += f'{" AND" if where_sql else " WHERE"} "{self_key}" = :{bind(record_id)}'
+        else:
+            where_sql += f'{" AND" if where_sql else " WHERE"} "{self_key}" IS NOT NULL'
+        return await count_rows(table["base_id"], table["id"], where_sql, params)
 
     # ---- GET /record-index ----------------------------------------------------
 
@@ -623,7 +831,7 @@ class AggregationService:
         view_id: str | None,
         ignore_view_query: bool,
     ) -> dict[str, Any]:
-        if search is None or len(search) < 2:
+        if search is None:
             raise _search_required()
         table, fields = await self._load(table_id)
         # missing views die before the filter merge in the reference stack.
@@ -666,7 +874,7 @@ class AggregationService:
                 HttpErrorCode.VALIDATION_ERROR,
                 {"localization": {"i18nKey": "httpErrors.aggregation.maxSearchIndexResult"}},
             )
-        if search is None or len(search) < 2:
+        if search is None:
             raise _search_required()
         table, fields = await self._load(table_id)
         # missing views die before the filter merge in the reference stack.
@@ -699,16 +907,33 @@ class AggregationService:
             limit=take,
             offset=skip,
         )
-        # one hit entry per matched search field, in search-field order
-        target_fields = []
-        for ref in str(search[1]).split(","):
-            field = self._records._resolve_field(fields, ref)
-            if field is not None and field not in target_fields:
-                target_fields.append(field)
+        # one hit entry per matched search field, in search-field order — the same
+        # target set _search_clause matched against (all searchable fields when the
+        # field ref is empty, else the resolved+searchable refs).
+        ref = search[1] if len(search) >= 2 else None
+        target_fields: list[dict[str, Any]] = []
+        if not ref:
+            target_fields = [f for f in fields if _field_searchable(f, str(search[0]), True)]
+        else:
+            for rid in str(ref).split(","):
+                field = self._records._resolve_field(fields, rid)
+                if (
+                    field is not None
+                    and field not in target_fields
+                    and _field_searchable(field, str(search[0]), False)
+                ):
+                    target_fields.append(field)
+        # one hit entry per field that actually matched on a row (not every
+        # searchable field), mirroring the reference's per-field searchMatches.
+        matched_map = await self._search_matched_fields(
+            table, target_fields, str(search[0]), [row["__id"] for row in rows]
+        )
         hits: list[tuple[str, str]] = []
         for row in rows:
+            row_matched = matched_map.get(row["__id"], set())
             for field in target_fields:
-                hits.append((row["__id"], field["id"]))
+                if field["id"] in row_matched:
+                    hits.append((row["__id"], field["id"]))
         if not hits:
             return None
 
@@ -741,6 +966,48 @@ class AggregationService:
             for record_id, field_id in hits
         ]
 
+    async def _search_matched_fields(
+        self,
+        table: dict[str, Any],
+        target_fields: list[dict[str, Any]],
+        value: str,
+        row_ids: list[str],
+    ) -> dict[str, set[str]]:
+        """Per-row set of target fields whose cell actually matches the term.
+
+        The reference returns one searchMatch per field that matched on a row,
+        so the ILIKE is evaluated per field (same projection as the OR clause)
+        instead of pairing every matched row with every searchable field."""
+        if not row_ids or not target_fields:
+            return {}
+        from sqlalchemy import text
+
+        from ...db import engine as db_engine
+
+        escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        cols = ", ".join(
+            f"({_search_text_expr(f)} ILIKE :__pat ESCAPE '\\') AS m{i}"
+            for i, f in enumerate(target_fields)
+        )
+        sql = (
+            f'SELECT "__id", {cols} FROM {self._table_ref(table)} '
+            'WHERE "__id" = ANY(:__ids)'
+        )
+        async with db_engine.session() as session:
+            rows = (
+                await session.execute(
+                    text(sql), {"__ids": row_ids, "__pat": f"%{escaped}%"}
+                )
+            ).mappings().all()
+        result: dict[str, set[str]] = {}
+        for row in rows:
+            matched = {
+                target_fields[i]["id"] for i in range(len(target_fields)) if row[f"m{i}"]
+            }
+            if matched:
+                result[row["__id"]] = matched
+        return result
+
     # ---- GET /group-points ------------------------------------------------------
 
     async def get_group_points(
@@ -763,9 +1030,9 @@ class AggregationService:
         group_fields = group_fields[:3]
         if not group_fields:
             return []
-        filter_obj = await self._merged_filter(table_id, view_id, filter_param, ignore_view_query)
-        if tql:
-            filter_obj = self._parse_tql(tql)
+        filter_obj = await self._merged_filter(
+            table_id, view_id, self._custom_filter(filter_param, tql), ignore_view_query
+        )
         where_sql, params = self._compile_where(fields, filter_obj, search, exact_only=True)
         rows = await self._run_group_query(table, group_fields, where_sql, params)
         row_count = await count_rows(table["base_id"], table_id, where_sql, params)
@@ -998,16 +1265,18 @@ class AggregationService:
         view_id: str | None,
         order_by: list[dict[str, Any]] | None,
         group_by: list[dict[str, Any]] | None,
+        collapsed_ids: list[str] | None,
         skip: int,
-        take: int | None,
+        take: int,
         ignore_view_query: bool,
     ) -> dict[str, Any]:
         # same recipe as getAggregation, but computed over the [skip, skip+take)
-        # slice of the filtered + sorted rows; groupBy folds into the ordering.
+        # slice of the filtered + sorted rows; groupBy folds into the ordering
+        # and collapsed groups are excluded so the slice tracks the grid.
         table, fields = await self._load(table_id)
-        filter_obj = await self._merged_filter(table_id, view_id, filter_param, ignore_view_query)
-        if tql:
-            filter_obj = self._parse_tql(tql)
+        filter_obj = await self._merged_filter(
+            table_id, view_id, self._custom_filter(filter_param, tql), ignore_view_query
+        )
         requested: list[tuple[str, str]] = []
         for func, field_ids in field_stats or []:
             for field_id in field_ids:
@@ -1034,6 +1303,18 @@ class AggregationService:
             return {"aggregations": []}
 
         where_sql, params = self._compile_where(fields, filter_obj, search, exact_only=True)
+        group_fields: list[tuple[dict[str, Any], str]] = []
+        for item in group_by or []:
+            field = self._records._resolve_field(fields, item.get("fieldId", ""))
+            if field is not None:
+                group_fields.append((field, item.get("order", "asc")))
+        group_fields = group_fields[:3]
+        if group_fields and collapsed_ids:
+            clause = await self._collapsed_selection_clause(
+                table, group_fields, collapsed_ids, where_sql, params, [0]
+            )
+            if clause:
+                where_sql += f'{" AND" if where_sql else " WHERE"} ({clause})'
         view_sort = None
         if view_id and not ignore_view_query:
             view = await get_view_row(table_id, view_id)
@@ -1051,16 +1332,12 @@ class AggregationService:
 
         columns = sorted({f'"{f["db_field_name"]}"' for f, _ in statistic_fields})
         selects = self._statistic_selects(statistic_fields)
-        if take is not None:
-            inner = (
-                f"SELECT {', '.join(columns)} FROM {self._table_ref(table)}"
-                f"{where_sql}{order_sql} LIMIT :__limit OFFSET :__offset"
-            )
-            sql = f"SELECT {selects} FROM ({inner}) AS __slice"
-            bind = {**params, "__limit": take, "__offset": skip}
-        else:
-            sql = f"SELECT {selects} FROM {self._table_ref(table)}{where_sql}"
-            bind = params
+        inner = (
+            f"SELECT {', '.join(columns)} FROM {self._table_ref(table)}"
+            f"{where_sql}{order_sql} LIMIT :__limit OFFSET :__offset"
+        )
+        sql = f"SELECT {selects} FROM ({inner}) AS __slice"
+        bind = {**params, "__limit": take, "__offset": skip}
         rows = await repository.raw_rows(sql, bind)
         row = rows[0] if rows else {}
         aggregations = [
@@ -1074,3 +1351,83 @@ class AggregationService:
             for field, func in statistic_fields
         ]
         return {"aggregations": aggregations}
+
+    async def _collapsed_selection_clause(
+        self,
+        table: dict[str, Any],
+        group_fields: list[tuple[dict[str, Any], str]],
+        collapsed_ids: list[str],
+        where_sql: str,
+        params: dict[str, Any],
+        counter: list[int],
+    ) -> str | None:
+        # Ports getFilterByCollapsedGroup: records inside a collapsed group are
+        # excluded so [skip, take) indexes the same visible rows the grid draws.
+        # Group ids reuse the display-value string2Hash the grid/client compute;
+        # membership is matched on the group-by key expressions rendered to text
+        # (deterministic per group, regardless of the value type).
+        collapsed = set(collapsed_ids)
+        if not collapsed:
+            return None
+        select_parts: list[str] = []
+        key_aliases: list[list[str]] = []
+        for depth, (field, _) in enumerate(group_fields):
+            select_parts.append(
+                f'{self._group_select_expr(field)} AS "{field["db_field_name"]}"'
+            )
+            aliases = []
+            for index, expr in enumerate(self._group_by_exprs(field)):
+                alias = f"__ck{depth}_{index}"
+                select_parts.append(f'({expr})::text AS "{alias}"')
+                aliases.append(alias)
+            key_aliases.append(aliases)
+        group_by_sql = ", ".join(
+            expr for field, _ in group_fields for expr in self._group_by_exprs(field)
+        )
+        order_terms = ", ".join(
+            self._group_order(field, order) for field, order in group_fields
+        )
+        rows = await repository.raw_rows(
+            f"SELECT {', '.join(select_parts)} FROM {self._table_ref(table)}"
+            f"{where_sql} GROUP BY {group_by_sql} ORDER BY {order_terms}",
+            params,
+        )
+        sentinel = object()
+        display: list[Any] = [sentinel] * len(group_fields)
+        key_paths: list[list[str]] = [[] for _ in group_fields]
+        matched: dict[str, list[tuple[dict[str, Any], list[str]]]] = {}
+        for row in rows:
+            for depth, (field, _) in enumerate(group_fields):
+                stringified = self._stringify_group_value(row[field["db_field_name"]])
+                if display[depth] is not sentinel and display[depth] == stringified:
+                    continue
+                parts = [
+                    display[i] if display[i] is not sentinel else None for i in range(depth)
+                ] + [stringified]
+                flag = f"{field['id']}_" + "_".join("" if p is None else p for p in parts)
+                group_id = str(_string2hash(flag))
+                display[depth] = stringified
+                for idx in range(depth + 1, len(group_fields)):
+                    display[idx] = sentinel
+                key_paths[depth] = [row[alias] for alias in key_aliases[depth]]
+                if group_id in collapsed and group_id not in matched:
+                    matched[group_id] = [
+                        (group_fields[i][0], key_paths[i]) for i in range(depth + 1)
+                    ]
+        if not matched:
+            return None
+        group_clauses = []
+        for path in matched.values():
+            depth_negations = []
+            for field, key_values in path:
+                equalities = []
+                for expr, value in zip(
+                    self._group_by_exprs(field), key_values, strict=True
+                ):
+                    bind = f"cg{counter[0]}"
+                    counter[0] += 1
+                    params[bind] = value
+                    equalities.append(f"({expr})::text IS NOT DISTINCT FROM :{bind}")
+                depth_negations.append("NOT (" + " AND ".join(equalities) + ")")
+            group_clauses.append("(" + " OR ".join(depth_negations) + ")")
+        return " AND ".join(group_clauses)

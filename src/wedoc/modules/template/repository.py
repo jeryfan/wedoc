@@ -194,11 +194,13 @@ async def delete_template_row(template_id: str) -> dict[str, Any]:
 
 async def increment_visit(template_id: str) -> None:
     async with db_engine.session() as session:
-        await session.execute(
+        result = await session.execute(
             Template.__table__.update()
             .where(Template.id == template_id)
             .values(visit_count=Template.visit_count + 1)
         )
+        if result.rowcount == 0:
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
         await session.commit()
 
 

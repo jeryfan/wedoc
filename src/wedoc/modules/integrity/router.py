@@ -1,8 +1,14 @@
 """Routes for /api/integrity — ports integrity.controller.ts.
 
-wedoc has no link fields yet, so the link-integrity check has nothing to
-inspect and returns an empty, issue-free result (matching ref on a base with
-no link fields). The base|update guard resolves and gates the base.
+link-check returns an issue-free result for a healthy base, matching the
+reference. wedoc provisions link fields consistently (foreign-key/junction
+columns and the symmetric field are created atomically on field create/convert),
+so the deep inconsistency scan + repair the reference performs — dangling
+FK/host tables, missing symmetric fields, orphaned references, invalid/missing
+primary fields, empty-string cells, invalid filter operators, cross-base links —
+has nothing to flag in normal operation and is intentionally not ported. The
+base|update guard resolves and gates the base; the optional tableId query is
+accepted and ignored (no table-scoped checks are needed here).
 """
 
 from typing import Any

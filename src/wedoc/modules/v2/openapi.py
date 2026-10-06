@@ -124,7 +124,6 @@ def build_openapi_spec() -> dict:
         "info": {"title": f"{upstream_brand().capitalize()} v2 API", "version": "0.0.0"},
         "servers": [{"url": f"{origin}/api/v2"}],
         "paths": paths,
-        "components": {},
     }
 
 

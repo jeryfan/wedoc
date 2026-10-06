@@ -1,11 +1,12 @@
 """Trash domain service — ports trash.service.ts (space/base/table v1 paths).
 
-Scope note: the table-level trash items (view/field/record snapshots),
-getTableTrashItemRecords and the restore-field SSE stream depend on the
-TableTrashListener + record_trash/table_trash snapshot pipeline (the v2
-record-removal cold-storage feature), which is not yet part of wedoc. Those
-paths are registered but deferred (documented in the ledger); the space/base
-(+ table restore/permanent-delete) paths are fully ported here.
+Scope note: getTableTrashItemRecords (record pagination + snapshot
+normalization), the reset-items table branch and operation-id record restore
+still depend on parts of the v2 record-removal pipeline not yet in wedoc, and
+stay deferred (documented in the ledger). The space/base paths, table
+restore/permanent-delete, the /trash/items table branch (filters +
+view/field/record resourceMap) and the restore-field SSE stream (field-only,
+terminal-frame approximation of the v2 progression) are ported here.
 """
 
 import json
@@ -144,29 +145,60 @@ class TrashService:
         }
 
     async def get_trash_items(
-        self, resource_id: str, resource_type: str, cursor: str | None, page_size: int
+        self,
+        resource_id: str,
+        resource_type: str,
+        cursor: str | None,
+        page_size: int,
+        resource_types: list[str] | None,
+        deleted_by: list[str] | None,
+        deleted_time_start: str | None,
+        deleted_time_end: str | None,
     ) -> dict[str, Any]:
         if resource_type == "base":
             return await self._get_base_trash_items(resource_id, cursor, page_size)
         if resource_type == "table":
-            return await self._get_table_trash_items(resource_id, cursor, page_size)
+            return await self._get_table_trash_items(
+                resource_id,
+                cursor,
+                page_size,
+                resource_types,
+                deleted_by,
+                deleted_time_start,
+                deleted_time_end,
+            )
         raise _invalid_resource_type(resource_type)
 
     async def _get_table_trash_items(
-        self, table_id: str, cursor: str | None, page_size: int
+        self,
+        table_id: str,
+        cursor: str | None,
+        page_size: int,
+        resource_types: list[str] | None,
+        deleted_by: list[str] | None,
+        deleted_time_start: str | None,
+        deleted_time_end: str | None,
     ) -> dict[str, Any]:
         from ...core.security.permissions import PermissionService
 
         await PermissionService().valid_permissions(
             table_id, ["table|trash_read"], cls.get("accessTokenId"), True
         )
-        rows = await repository.list_table_trash(table_id, cursor, page_size + 1, None)
+        rows = await repository.list_table_trash(
+            table_id,
+            cursor,
+            page_size + 1,
+            resource_types,
+            deleted_by,
+            deleted_time_start,
+            deleted_time_end,
+        )
         next_cursor = None
         if len(rows) > page_size:
             next_cursor = rows.pop()["id"]
         trash_items: list[dict[str, Any]] = []
-        deleted_by: set[str] = set()
-        record_ids: list[str] = []
+        deleted_by_set: set[str] = set()
+        preview_ids: dict[str, list[str]] = {"view": [], "field": [], "record": []}
         for item in rows:
             snapshot = json.loads(item["snapshot"])
             resource_type = item["resourceType"]
@@ -185,15 +217,35 @@ class TrashService:
                     "totalResourceCount": len(resource_ids),
                 }
             )
-            deleted_by.add(item["createdBy"])
-            if resource_type == "record":
-                record_ids.extend(preview)
+            deleted_by_set.add(item["createdBy"])
+            if resource_type in preview_ids:
+                preview_ids[resource_type].extend(preview)
         resource_map: dict[str, Any] = {}
-        if record_ids:
-            for rt in await repository.list_record_trash(table_id, record_ids):
-                snap = json.loads(rt["snapshot"])
-                resource_map[rt["recordId"]] = {"id": rt["recordId"], "name": snap.get("name")}
-        users = await repository.user_info_list(list(deleted_by))
+        for view in await repository.list_deleted_views(preview_ids["view"]):
+            resource_map[view["id"]] = {
+                "id": view["id"],
+                "name": view["name"],
+                "type": view["type"],
+            }
+        for field in await repository.list_deleted_fields(preview_ids["field"]):
+            entry: dict[str, Any] = {
+                "id": field["id"],
+                "name": field["name"],
+                "type": field["type"],
+            }
+            if field["options"]:
+                options = json.loads(field["options"])
+                # Select choices live in a separate store, so the trash listing's
+                # bare field-options read never carries them; other option keys stay.
+                options.pop("choices", None)
+                entry["options"] = options
+            entry["isLookup"] = field["isLookup"]
+            entry["isConditionalLookup"] = field["isConditionalLookup"]
+            resource_map[field["id"]] = entry
+        for rt in await repository.list_record_trash(table_id, preview_ids["record"]):
+            snap = json.loads(rt["snapshot"])
+            resource_map[rt["recordId"]] = {"id": rt["recordId"], "name": snap.get("name")}
+        users = await repository.user_info_list(list(deleted_by_set))
         # hide record items until every preview id has a materialized snapshot,
         # matching the reference's list/restore race guard (wedoc writes the
         # snapshot synchronously, so ready items are never withheld here).
@@ -255,6 +307,62 @@ class TrashService:
             "nextCursor": None,
         }
 
+    async def restore_field_trash_stream(
+        self, trash_id: str, table_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Restore soft-deleted fields captured under a table_trash 'field' row.
+
+        Returns the SSE frames to emit. The reference streams a v2
+        preparing/restoring/done progression while it recomputes record values;
+        wedoc's restore_field only clears the tombstone (physical column + data
+        retained), so a single terminal 'done' frame is emitted (approximation).
+        """
+        if not table_id:
+            return [
+                self._restore_field_error(
+                    "preparing", f"Table id is required to restore table trash {trash_id}"
+                )
+            ]
+        item = await repository.find_table_trash(trash_id, table_id)
+        if item is None or item["resourceType"] != "field":
+            return [
+                self._restore_field_error(
+                    "preparing", f"The table trash {trash_id} not found"
+                )
+            ]
+        snapshot = json.loads(item["snapshot"])
+        field_ids = [f["id"] for f in snapshot.get("fields", [])]
+        from ..field.service import FieldService
+
+        service = FieldService()
+        for field_id in field_ids:
+            # restore_field is a no-op (returns None) for ids already restored or
+            # gone, so partial/duplicate restores are handled gracefully.
+            await service.restore_field(table_id, field_id)
+        await repository.delete_table_trash(trash_id, table_id)
+        total_count = await self._table_record_count(table_id)
+        return [{"id": "done", "totalCount": total_count, "updatedCount": 0}]
+
+    @staticmethod
+    def _restore_field_error(phase: str, message: str) -> dict[str, Any]:
+        return {
+            "id": "error",
+            "phase": phase,
+            "batchIndex": -1,
+            "totalCount": 0,
+            "processedCount": 0,
+            "updatedCount": 0,
+            "message": message,
+        }
+
+    async def _table_record_count(self, table_id: str) -> int:
+        from ..field import repository as field_repository
+
+        table = await field_repository.get_table_meta_by_id(table_id, include_deleted=True)
+        if table is None:
+            return 0
+        return await field_repository.count_data_rows(table["base_id"], table_id)
+
     async def _get_base_trash_items(
         self, base_id: str, cursor: str | None, page_size: int
     ) -> dict[str, Any]:
@@ -296,10 +404,35 @@ class TrashService:
     async def restore_trash(self, trash_id: str, table_id: str | None) -> None:
         trash = await repository.find_trash(trash_id)
         if trash is None:
+            # record deletions live in table_trash (not the space/base/table trash
+            # table) and are addressed with the tableId query param; restore them by
+            # re-inserting from the record_trash snapshots.
+            if table_id:
+                item = await repository.find_table_trash(trash_id, table_id)
+                if item is not None and item["resourceType"] == "record":
+                    await self._restore_record_trash(trash_id, table_id, item)
+                    return
             raise _trash_not_found(trash_id)
         await self._assert_parent_not_trashed(trash["parentId"])
         await self._restore_resource(trash["resourceType"], trash["resourceId"])
         await repository.delete_trash(trash_id)
+
+    async def _restore_record_trash(
+        self, trash_id: str, table_id: str, item: dict[str, Any]
+    ) -> None:
+        from ..record.service import RecordService
+
+        record_ids = json.loads(item["snapshot"])
+        snaps: dict[str, dict[str, Any]] = {}
+        for row in await repository.list_record_trash(table_id, record_ids):
+            snaps.setdefault(row["recordId"], json.loads(row["snapshot"] or "{}"))
+        records = [
+            {"id": rid, "fields": (snaps.get(rid) or {}).get("fields", {})}
+            for rid in record_ids
+        ]
+        await RecordService().restore_records(table_id, records)
+        await repository.delete_table_trash(trash_id, table_id)
+        await repository.delete_record_trash(table_id, record_ids)
 
     async def _restore_resource(self, resource_type: str, resource_id: str) -> None:
         from ...core.security.permissions import PermissionService

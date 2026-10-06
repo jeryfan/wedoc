@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ...core.security.auth import auth_guard
+from ...core.security.auth import auth_guard, permissions, resource_meta
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
 from .openapi import build_docs_html, build_openapi_spec
@@ -89,6 +89,8 @@ async def get_table(request: Request) -> JSONResponse:
 
 
 @router.get("/getComputeActivity")
+@permissions("table|read")
+@resource_meta("tableId", "query")
 async def get_compute_activity(request: Request) -> JSONResponse:
     payload = dict(request.query_params)
     issues = [
@@ -105,16 +107,17 @@ async def get_compute_activity(request: Request) -> JSONResponse:
 @router.delete("/deleteRecords")
 async def delete_records(request: Request) -> JSONResponse:
     payload = await read_json_body(request)
-    issue = _require_string(payload, "tableId")
-    if issue:
-        return _validation_error([issue])
+    issues: list[tuple[str, str]] = []
+    tid = _require_string(payload, "tableId")
+    if tid:
+        issues.append(tid)
     record_ids = payload.get("recordIds") if isinstance(payload, dict) else None
     if not isinstance(record_ids, list):
-        return _validation_error(
-            [("recordIds", "Invalid input: expected array, received undefined")]
-        )
-    if len(record_ids) < 1:
-        return _validation_error([("recordIds", "At least one recordId is required")])
+        issues.append(("recordIds", "Invalid input: expected array, received undefined"))
+    elif len(record_ids) < 1:
+        issues.append(("recordIds", "At least one recordId is required"))
+    if issues:
+        return _validation_error(issues)
     try:
         return _ok(await V2Service().delete_records(payload))
     except V2Error as exc:
@@ -124,13 +127,17 @@ async def delete_records(request: Request) -> JSONResponse:
 @router.post("/updateRecords")
 async def update_records(request: Request) -> JSONResponse:
     payload = await read_json_body(request)
-    issue = _require_string(payload, "tableId")
-    if issue:
-        return _validation_error([issue])
-    if not isinstance(payload.get("fieldKeyType"), str):
-        return _validation_error(
-            [("fieldKeyType", 'Invalid option: expected one of "name"|"id"')]
+    issues: list[tuple[str, str]] = []
+    tid = _require_string(payload, "tableId")
+    if tid:
+        issues.append(tid)
+    ft = payload.get("fieldKeyType") if isinstance(payload, dict) else None
+    if ft is not None and ft not in ("id", "name", "dbFieldName"):
+        issues.append(
+            ("fieldKeyType", 'Invalid option: expected one of "id"|"name"|"dbFieldName"')
         )
+    if issues:
+        return _validation_error(issues)
     has_records = payload.get("records") is not None
     has_filter = payload.get("filter") is not None
     has_record_ids = payload.get("recordIds") is not None

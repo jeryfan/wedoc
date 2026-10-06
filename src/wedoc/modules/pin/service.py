@@ -23,8 +23,14 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _js_number(value: Any) -> Any:
+    # order is a Double column; JSON.stringify renders whole values without a
+    # trailing .0, so mirror that (1.0 -> 1, 1.5 -> 1.5).
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
 def _pin_vo(row: dict[str, Any]) -> dict[str, Any]:
-    return {**row, "createdTime": _iso(row["createdTime"])}
+    return {**row, "createdTime": _iso(row["createdTime"]), "order": _js_number(row["order"])}
 
 
 class PinService:
@@ -71,7 +77,7 @@ class PinService:
             entry: dict[str, Any] = {
                 "id": pin["resourceId"],
                 "type": pin["type"],
-                "order": pin["order"],
+                "order": _js_number(pin["order"]),
             }
             for key, value in resource.items():
                 if value is not None:

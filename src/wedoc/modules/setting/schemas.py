@@ -8,9 +8,9 @@ those paths need live AI providers to exercise meaningfully).
 
 from typing import Annotated, Any
 
-from pydantic import StrictBool, field_validator
+from pydantic import Field, StrictBool, field_validator
 
-from ...core.validation import ZodEnumStr, ZodModel, ZodNonOptional, ZodNullable
+from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel, ZodNonOptional, ZodNullable
 
 _NullableMailConfig = Annotated[dict[str, Any] | None, ZodNullable()]
 
@@ -132,8 +132,8 @@ class TestApiKeyRo(ZodModel):
 class AdminSendNotificationRo(ZodModel):
     message: str
     severity: ZodEnumStr(_SEVERITIES) = "info"
-    userIds: list[str] | None = None
-    emails: list[str] | None = None
+    userIds: list[str] | None = Field(default=None, max_length=500)
+    emails: list[ZodEmailStr] | None = Field(default=None, max_length=500)
 
     @field_validator("message")
     @classmethod

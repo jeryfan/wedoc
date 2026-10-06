@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import csv
 import io
+import ipaddress
 import re
+import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 import chardet
 import httpx
@@ -122,8 +125,44 @@ def _parse_content_disposition(disposition: str | None) -> str | None:
     return None
 
 
+async def _assert_public_host(url: str) -> None:
+    """SSRF guard: refuse import fetches whose host resolves to a private,
+    loopback, link-local, multicast, or reserved address (the reference blocks
+    such "meta IP" targets). The app's own loopback origin — where relative
+    attachment paths resolve — stays allowed so owned-attachment imports work."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    scheme = parts.scheme or "http"
+    port = parts.port or (443 if scheme == "https" else 80)
+    if host in ("localhost", "127.0.0.1", "::1") and port == get_settings().port:
+        return
+    import asyncio
+
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )
+    except OSError:
+        return
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ApiError(
+                f"Fetching an import file from a non-public address is not allowed: {host}",
+                HttpErrorCode.VALIDATION_ERROR,
+            )
+
+
 async def fetch_file(attachment_url: str) -> tuple[bytes, str]:
     url = _resolve_url(attachment_url)
+    await _assert_public_host(url)
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(url)
         if resp.status_code >= 400:

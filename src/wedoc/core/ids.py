@@ -5,6 +5,7 @@ Domain ids: 3-char prefix + random string from the alphabet
 """
 
 import os
+import re
 import secrets
 import time
 from enum import StrEnum
@@ -78,6 +79,17 @@ def identify(id_: str) -> IdPrefix | None:
         return IdPrefix(id_[:3])
     except ValueError:
         return None
+
+
+def is_valid_prefixed_id(value: object, prefix: str, allow_suffix: bool = False) -> bool:
+    """Prefixed-id format check: ``<prefix>`` + 1-64 alphanumerics, optionally a
+    ``_<n>`` suffix (derived field ids). Parsing stays looser than generation so
+    legacy/imported ids of other body lengths still pass, matching the reference
+    id value-objects (RecordId/FieldId/ViewId)."""
+    if not isinstance(value, str):
+        return False
+    suffix = r"(?:_\d+)?" if allow_suffix else ""
+    return re.fullmatch(rf"{re.escape(prefix)}[0-9a-zA-Z]{{1,64}}{suffix}", value) is not None
 
 
 _cuid_counter = int.from_bytes(os.urandom(2), "big") % 1679616

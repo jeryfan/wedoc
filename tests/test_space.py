@@ -8,6 +8,7 @@ from wedoc.modules.space.schemas import (
     AddCollaboratorsBody,
     BaseEntryMapQuery,
     CreateSpaceBody,
+    EmailInvitationBody,
     ListCollaboratorQuery,
     SpaceSearchQuery,
 )
@@ -64,6 +65,14 @@ class TestSpaceSearchQuery:
             zod_validate(SpaceSearchQuery, {"search": "x", "pageSize": "51"})
         assert "<=50" in exc.value.message
 
+    def test_type_enum_lowercase_only(self):
+        # the search `type` accepts the full lowercase ResourceType enum; a
+        # capitalized value is rejected.
+        assert zod_validate(SpaceSearchQuery, {"search": "x", "type": "record"}).type == "record"
+        with pytest.raises(ApiError) as exc:
+            zod_validate(SpaceSearchQuery, {"search": "x", "type": "Base"})
+        assert 'expected one of "space"|"base"|"table"' in exc.value.message
+
 
 class TestListCollaboratorQuery:
     def test_coerce_boolean_truthy_string(self):
@@ -76,7 +85,7 @@ class TestListCollaboratorQuery:
     def test_principal_type_enum(self):
         with pytest.raises(ApiError) as exc:
             zod_validate(ListCollaboratorQuery, {"type": "alien"})
-        assert 'Invalid option: expected one of "user"|"User"' in exc.value.message
+        assert 'Invalid option: expected one of "user"|"department"' in exc.value.message
 
 
 class TestAddCollaboratorsBody:
@@ -97,3 +106,12 @@ class TestAddCollaboratorsBody:
                     "role": "superadmin",
                 },
             )
+
+
+class TestEmailInvitationBody:
+    def test_emails_must_be_nonempty(self):
+        body = zod_validate(EmailInvitationBody, {"emails": ["a@example.com"], "role": "editor"})
+        assert body.emails == ["a@example.com"]
+        with pytest.raises(ApiError) as exc:
+            zod_validate(EmailInvitationBody, {"emails": [], "role": "editor"})
+        assert 'Too small: expected array to have >=1 items at "emails"' in exc.value.message

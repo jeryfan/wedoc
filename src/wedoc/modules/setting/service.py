@@ -6,6 +6,7 @@ paths keep the upstream contract + error shape but defer the real vendor calls
 (documented in the parity ledger).
 """
 
+import os
 from typing import Any
 
 from ...compat import upstream_brand
@@ -28,6 +29,16 @@ _BRAND_LOGO = "brandLogo"
 _INSTANCE_ID = "instanceId"
 _AI_CONFIG = "aiConfig"
 _APP_CONFIG = "appConfig"
+
+_BUILD_VERSION_ENV_KEYS = ("BUILD_VERSION", "NEXT_PUBLIC_BUILD_VERSION", "APP_VERSION")
+
+
+def _resolve_build_version() -> str:
+    for key in _BUILD_VERSION_ENV_KEYS:
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 _PUBLIC_KEYS = [
     _INSTANCE_ID,
@@ -97,6 +108,17 @@ class SettingService:
         result[_AI_CONFIG] = public_ai
         result["appGenerationEnabled"] = bool(app_config.get("vercelToken"))
         result["availableIntegrationProviders"] = self._available_integration_providers()
+        # Enterprise public-setting fields: wedoc ships none of these optional
+        # integrations, so each reports the unconfigured default the reference
+        # returns for an instance without them (socialAuthProviders/buildVersion
+        # stay env-driven).
+        result["githubAppConfigured"] = False
+        result["scrapeEnabled"] = False
+        result["connectorEventEnabled"] = False
+        result["mobileAuthExchange"] = True
+        result["socialAuthProviders"] = settings.social_providers
+        result["emailCodeSigninEnabled"] = False
+        result["buildVersion"] = _resolve_build_version()
         result["turnstileSiteKey"] = getattr(settings, "backend_turnstile_site_key", None)
         result["changeEmailSendCodeMailRate"] = settings.backend_change_email_send_code_mail_rate
         result["resetPasswordSendMailRate"] = settings.backend_reset_password_send_mail_rate

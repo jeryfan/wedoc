@@ -21,6 +21,8 @@ from .schemas import (
 )
 from .service import SettingService
 
+_LOGO_MAX_SIZE = 500 * 1024
+
 # --- public (no auth) ------------------------------------------------------
 public_router = APIRouter(prefix="/api/admin/setting")
 
@@ -71,6 +73,8 @@ async def upload_logo(file: UploadFile) -> dict[str, Any]:
     if not content_type.startswith("image/"):
         raise ApiError("Invalid file type", HttpErrorCode.VALIDATION_ERROR)
     data = await file.read()
+    if len(data) > _LOGO_MAX_SIZE:
+        raise ApiError("File too large", HttpErrorCode.PAYLOAD_TOO_LARGE)
     return await SettingService().upload_logo(data, content_type)
 
 

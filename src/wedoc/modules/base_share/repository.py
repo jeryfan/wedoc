@@ -6,7 +6,7 @@ from sqlalchemy import delete, insert, select, update
 
 from ...core.ids import cuid
 from ...db import engine as db_engine
-from ...db.models_meta import BaseShare, TableMeta
+from ...db.models_meta import BaseShare, TableMeta, View
 
 
 def _row(share: BaseShare) -> dict[str, Any]:
@@ -98,6 +98,19 @@ async def delete_by_id(id_: str) -> None:
         await session.commit()
 
 
+async def delete_by_base_node(base_id: str, node_id: str) -> list[str]:
+    async with db_engine.session() as session:
+        rows = (
+            await session.execute(
+                delete(BaseShare)
+                .where(BaseShare.base_id == base_id, BaseShare.node_id == node_id)
+                .returning(BaseShare.share_id)
+            )
+        ).all()
+        await session.commit()
+    return [r[0] for r in rows]
+
+
 async def create(
     base_id: str, share_id: str, node_id: str | None, created_by: str
 ) -> dict[str, Any]:
@@ -151,6 +164,17 @@ async def first_table_id(base_id: str) -> str | None:
                 select(TableMeta.id)
                 .where(TableMeta.base_id == base_id, TableMeta.deleted_time.is_(None))
                 .order_by(TableMeta.order.asc())
+            )
+        ).scalars().first()
+
+
+async def first_view_id(table_id: str) -> str | None:
+    async with db_engine.session() as session:
+        return (
+            await session.execute(
+                select(View.id)
+                .where(View.table_id == table_id, View.deleted_time.is_(None))
+                .order_by(View.order.asc())
             )
         ).scalars().first()
 

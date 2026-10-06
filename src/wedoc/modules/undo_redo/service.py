@@ -25,6 +25,13 @@ ENGINE = "v1"
 _MISSING_WINDOW = "Missing windowId for undo/redo operation"
 
 
+def engine_for(result: dict[str, Any]) -> str:
+    # Only the missing-windowId validation failure routes through the v2 engine
+    # upstream (it is the sole result carrying errorCode); every real v1 replay
+    # — empty, fulfilled, or a replay-time failure — reports the v1 engine.
+    return "v2" if result.get("errorCode") else ENGINE
+
+
 class UndoRedoService:
     def __init__(self) -> None:
         self._stack = UndoRedoStackService()
@@ -80,12 +87,15 @@ class UndoRedoService:
     @staticmethod
     def _terminal_event(mode: str, result: dict[str, Any]) -> dict[str, Any]:
         if result["status"] == "failed":
-            return {
+            event = {
                 "id": "error",
                 "mode": mode,
-                "engine": ENGINE,
+                "engine": engine_for(result),
                 "message": result.get("errorMessage", "Undo/redo failed"),
             }
+            if result.get("errorCode"):
+                event["code"] = result["errorCode"]
+            return event
         return {"id": "done", "mode": mode, "engine": ENGINE, "status": result["status"]}
 
     # ---- replay ------------------------------------------------------------
@@ -211,7 +221,9 @@ class UndoRedoService:
         if not by_key:
             return
         value = by_key["oldValue"] if mode == "undo" else by_key["newValue"]
-        await ViewService().update_json_prop(table_id, view_id, by_key["key"], value)
+        await ViewService().update_json_prop(
+            table_id, view_id, by_key["key"], value, validate=False
+        )
 
     async def _replay_update_records_order(self, operation: Operation, mode: str) -> None:
         from ..view.service import ViewService

@@ -29,6 +29,19 @@ async def get_node_row(node_id: str) -> dict[str, Any] | None:
     return _node_row(row) if row else None
 
 
+async def get_node_id_by_resource_id(base_id: str, resource_id: str) -> str | None:
+    async with db_engine.session() as session:
+        row = (
+            await session.execute(
+                select(BaseNode.id).where(
+                    BaseNode.base_id == base_id,
+                    BaseNode.resource_id == resource_id,
+                )
+            )
+        ).first()
+    return row[0] if row else None
+
+
 async def get_node_by_resource(
     base_id: str, resource_type: str, resource_id: str
 ) -> dict[str, Any] | None:

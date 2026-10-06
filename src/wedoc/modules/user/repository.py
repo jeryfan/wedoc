@@ -4,14 +4,28 @@ Raw-row access only — no business rules here (that lives in service.py).
 Rows are returned as plain dicts with snake_case column names.
 """
 
+import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 
 from ...core.ids import cuid
 from ...db import engine as db_engine
-from ...db.models_meta import Account, Attachments, User, UserLastVisit
+from ...db.models_meta import (
+    Account,
+    Attachments,
+    Base,
+    Collaborator,
+    Field,
+    Space,
+    TableMeta,
+    User,
+    UserLastVisit,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _user_dict(row: User) -> dict[str, Any]:
@@ -95,8 +109,6 @@ async def update_user_row(
 
 
 async def update_notify_meta(user_id: str, merged: dict[str, Any]) -> None:
-    import json
-
     async with db_engine.session() as session:
         row = (
             await session.execute(
@@ -235,3 +247,113 @@ async def delete_last_visits_for_user(user_id: str) -> None:
     async with db_engine.session() as session:
         await session.execute(delete(UserLastVisit).where(UserLastVisit.user_id == user_id))
         await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# user rename propagation — patch the denormalized user-cell title snapshots
+# ---------------------------------------------------------------------------
+
+
+def _quote_ident(name: str) -> str:
+    if "\x00" in name:
+        raise ValueError("identifier contains null byte")
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
+async def list_user_snapshot_fields(user_id: str) -> list[dict[str, Any]]:
+    """Non-lookup ``user`` fields in tables of bases the user can access.
+
+    Mirrors the reference user-rename propagation scope (collaborator -> base,
+    directly or through the space). ``createdBy``/``lastModifiedBy`` are omitted
+    because their physical column is never populated here — those cells re-derive
+    the title from the ``users`` row at read time and are therefore never stale.
+    """
+    space_bases = (
+        select(Base.id)
+        .join(Space, Base.space_id == Space.id)
+        .join(Collaborator, Collaborator.resource_id == Space.id)
+        .where(
+            Collaborator.principal_type == "user",
+            Collaborator.principal_id == user_id,
+            Collaborator.resource_type == "space",
+            Space.deleted_time.is_(None),
+            Base.deleted_time.is_(None),
+        )
+    )
+    base_bases = (
+        select(Base.id)
+        .join(Space, Base.space_id == Space.id)
+        .join(Collaborator, Collaborator.resource_id == Base.id)
+        .where(
+            Collaborator.principal_type == "user",
+            Collaborator.principal_id == user_id,
+            Collaborator.resource_type == "base",
+            Space.deleted_time.is_(None),
+            Base.deleted_time.is_(None),
+        )
+    )
+    accessible = space_bases.union(base_bases).subquery()
+    stmt = (
+        select(
+            Field.id,
+            Field.table_id,
+            Field.db_field_name,
+            Field.is_multiple_cell_value,
+            TableMeta.base_id,
+        )
+        .join(TableMeta, Field.table_id == TableMeta.id)
+        .where(
+            TableMeta.base_id.in_(select(accessible.c.id)),
+            Field.type == "user",
+            Field.is_lookup.is_(None),
+            Field.deleted_time.is_(None),
+            TableMeta.deleted_time.is_(None),
+        )
+    )
+    async with db_engine.session() as session:
+        rows = (await session.execute(stmt)).mappings().all()
+    return [dict(row) for row in rows]
+
+
+async def patch_user_snapshot_titles(
+    fields: list[dict[str, Any]], user_id: str, name: str
+) -> None:
+    """Rewrite the ``title`` of every stored user cell that references ``user_id``.
+
+    Runs one UPDATE per affected physical field; a failure on one field is logged
+    and skipped so a single bad table cannot abort the whole rename.
+    """
+    for field in fields:
+        table = f"{_quote_ident(field['base_id'])}.{_quote_ident(field['table_id'])}"
+        col = _quote_ident(field["db_field_name"])
+        if field.get("is_multiple_cell_value"):
+            sql = (
+                f"UPDATE {table} SET {col} = ("
+                "  SELECT jsonb_agg("
+                "    CASE WHEN elem->>'id' = :uid"
+                "    THEN jsonb_set(elem, '{title}', to_jsonb(CAST(:name AS text)))"
+                "    ELSE elem END)"
+                f"  FROM jsonb_array_elements({col}) AS elem)"
+                f" WHERE {col} IS NOT NULL AND {col} @> CAST(:probe AS jsonb)"
+            )
+            params = {"uid": user_id, "name": name, "probe": json.dumps([{"id": user_id}])}
+        else:
+            # single user cell is a text column holding one JSON object; cast to
+            # jsonb to edit the title, then back to text to store.
+            sql = (
+                f"UPDATE {table} SET {col} = "
+                f"jsonb_set({col}::jsonb, '{{title}}', to_jsonb(CAST(:name AS text)))::text"
+                f" WHERE {col} IS NOT NULL AND {col}::jsonb->>'id' = :uid"
+            )
+            params = {"uid": user_id, "name": name}
+        try:
+            async with db_engine.session() as session:
+                await session.execute(text(sql), params)
+                await session.commit()
+        except Exception:
+            logger.exception(
+                "user-rename snapshot patch failed for field %s in %s",
+                field.get("id"),
+                table,
+            )

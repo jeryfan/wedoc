@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 
+from ...core.query import query_array, query_list
 from ...core.security.auth import auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
@@ -24,7 +25,7 @@ router = APIRouter(
 @router.get("/socket/snapshot-bulk", status_code=200)
 @permissions("field|read")
 async def socket_snapshot_bulk(tableId: str, request: Request) -> list[dict[str, Any]]:
-    ids = request.query_params.getlist("ids")
+    ids = query_list(request.query_params, "ids")
     return await FieldService().socket_snapshot_bulk(tableId, ids)
 
 
@@ -37,7 +38,8 @@ async def socket_doc_ids(tableId: str, request: Request) -> dict[str, Any]:
 @router.get("/delete-references", status_code=200)
 @permissions("field|delete")
 async def delete_references(tableId: str, request: Request) -> dict[str, Any]:
-    return await FieldService().delete_references(tableId, request.query_params.getlist("fieldIds"))
+    field_ids = query_array(request.query_params, "fieldIds", required=True) or []
+    return await FieldService().delete_references(tableId, field_ids)
 
 
 @router.get("/{fieldId}/filter-link-records", status_code=200)
@@ -55,8 +57,8 @@ async def get_field(tableId: str, fieldId: str) -> dict[str, Any]:
 @router.get("", status_code=200)
 @permissions("field|read")
 async def list_fields(tableId: str, request: Request) -> list[dict[str, Any]]:
-    projection = request.query_params.getlist("projection")
-    return await FieldService().list_fields(tableId, projection or None)
+    projection = query_array(request.query_params, "projection")
+    return await FieldService().list_fields(tableId, projection)
 
 
 @router.post("", status_code=201)
@@ -103,9 +105,10 @@ async def plan_create_field(tableId: str, request: Request) -> dict[str, Any]:
 
 @router.patch("/{fieldId}", status_code=200)
 @permissions("field|update")
-async def update_field(tableId: str, fieldId: str, request: Request) -> dict[str, Any]:
+async def update_field(tableId: str, fieldId: str, request: Request) -> Response:
     body = FieldPatchBody.zod_validate(await read_json_body(request))
-    return await FieldService().update_field(tableId, fieldId, body)
+    await FieldService().update_field(tableId, fieldId, body)
+    return Response(status_code=200)
 
 
 @router.delete("/{fieldId}", status_code=200)
@@ -118,7 +121,8 @@ async def delete_field(tableId: str, fieldId: str) -> Response:
 @router.delete("", status_code=200)
 @permissions("field|delete")
 async def delete_fields(tableId: str, request: Request) -> Response:
-    await FieldService().delete_fields(tableId, request.query_params.getlist("fieldIds"))
+    field_ids = query_array(request.query_params, "fieldIds", required=True) or []
+    await FieldService().delete_fields(tableId, field_ids)
     return Response(status_code=200)
 
 

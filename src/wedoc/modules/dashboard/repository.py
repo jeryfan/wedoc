@@ -22,6 +22,10 @@ def _not_found_plugin() -> ApiError:
     return ApiError("Plugin not found", HttpErrorCode.NOT_FOUND, _PLUGIN_NOT_FOUND)
 
 
+def _server_error() -> ApiError:
+    return ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
+
+
 async def list_dashboards(base_id: str) -> list[dict[str, Any]]:
     async with db_engine.session() as session:
         rows = (
@@ -45,6 +49,20 @@ async def get_dashboard(base_id: str, dashboard_id: str) -> dict[str, Any]:
         ).first()
     if row is None:
         raise _not_found_dashboard()
+    return {"id": row[0], "name": row[1], "layout": row[2]}
+
+
+async def get_dashboard_or_500(base_id: str, dashboard_id: str) -> dict[str, Any]:
+    async with db_engine.session() as session:
+        row = (
+            await session.execute(
+                select(Dashboard.id, Dashboard.name, Dashboard.layout).where(
+                    Dashboard.id == dashboard_id, Dashboard.base_id == base_id
+                )
+            )
+        ).first()
+    if row is None:
+        raise _server_error()
     return {"id": row[0], "name": row[1], "layout": row[2]}
 
 
@@ -72,6 +90,20 @@ async def get_layout(base_id: str, dashboard_id: str) -> str | None:
         ).first()
     if row is None:
         raise _not_found_dashboard()
+    return row[0]
+
+
+async def get_layout_or_500(base_id: str, dashboard_id: str) -> str | None:
+    async with db_engine.session() as session:
+        row = (
+            await session.execute(
+                select(Dashboard.layout).where(
+                    Dashboard.id == dashboard_id, Dashboard.base_id == base_id
+                )
+            )
+        ).first()
+    if row is None:
+        raise _server_error()
     return row[0]
 
 

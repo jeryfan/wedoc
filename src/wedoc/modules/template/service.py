@@ -71,14 +71,15 @@ class TemplateService:
             return {} if empty_when_null else None
         parsed = json.loads(cover)
         path = parsed.get("path")
-        thumbnail = parsed.get("thumbnailPath") or {}
-        final = thumbnail.get("lg") or path
-        return {**parsed, "presignedUrl": get_public_full_storage_url(final) if final else None}
+        return {**parsed, "presignedUrl": get_public_full_storage_url(path) if path else None}
 
     def _transform_list_item(
         self, row: dict[str, Any], user_map: dict[str, Any], keys: tuple[str, ...] | None
     ) -> dict[str, Any]:
         item = {k: row[k] for k in keys} if keys else dict(row)
+        # order is a double column; JS serializes a whole value as an int.
+        if isinstance(item.get("order"), float) and item["order"].is_integer():
+            item["order"] = int(item["order"])
         if row.get("cover"):
             parsed = json.loads(row["cover"])
             path = parsed.get("path")
@@ -225,6 +226,8 @@ class TemplateService:
         else:
             result.pop("snapshot", None)
         result["createdBy"] = user_map.get(template["createdBy"])
+        if result["createdBy"] is None:
+            result.pop("createdBy", None)
         return result
 
     async def get_template_by_base_id(self, base_id: str) -> dict[str, Any] | None:

@@ -4,6 +4,7 @@ Ports features/collaborator/collaborator.service.ts (space-facing surface).
 Used by the space module now and the base module later.
 """
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -144,6 +145,7 @@ class CollaboratorService:
             "role": row["role_name"],
             "createdTime": _iso(row["created_time"]),
             "lastSignTime": _iso((user or {}).get("last_sign_time")),
+            "billable": True,
         }
         base = base_map.get(row["resource_id"])
         if base:
@@ -212,6 +214,7 @@ class CollaboratorService:
                 "spaceRole": group["space_role"],
                 "baseCount": group["base_count"],
                 "createdTime": _iso(group["created_time"]),
+                "billable": True,
             }
             if user.get("is_system"):
                 item["isSystem"] = True
@@ -308,9 +311,59 @@ class CollaboratorService:
         await self.validate_user_add_role(user_id, role, space_id, RESOURCE_SPACE)
         user_ids = [c["principalId"] for c in collaborators if c["principalType"] == "user"]
         await self._validate_collaborator_users(user_ids)
-        return await self.create_space_collaborator(
+        result = await self.create_space_collaborator(
             collaborators=collaborators, space_id=space_id, role=role, created_by=user_id
         )
+        await self._notify_collaborator_invite(
+            user_id, user_ids, RESOURCE_SPACE, space_id
+        )
+        return result
+
+    async def _notify_collaborator_invite(
+        self, from_user_id: str, to_user_ids: list[str], resource_type: str, resource_id: str
+    ) -> None:
+        """Emit a collaboratorInvite notification to each freshly added user
+        (ports CollaboratorInvitedEvent -> notification.service)."""
+        recipients = [uid for uid in to_user_ids if uid and uid != from_user_id]
+        if not recipients:
+            return
+        from ..notification import repository as notify_repository
+        from ..notification.service import NotificationService
+
+        if resource_type == RESOURCE_SPACE:
+            space = await repository.get_space_row(resource_id)
+            resource_name = space["name"] if space else ""
+            url_path = f"/space/{resource_id}"
+            i18n_key = "email.templates.notify.collaboratorInvite.space"
+        else:
+            from ..base import repository as base_repository
+
+            base = await base_repository.get_base_row(resource_id, include_deleted=True)
+            resource_name = base["name"] if base else ""
+            url_path = f"/base/{resource_id}"
+            i18n_key = "email.templates.notify.collaboratorInvite.base"
+        from_user = (await notify_repository.get_users_by_ids([from_user_id])).get(from_user_id)
+        from_name = (from_user or {}).get("name") or ""
+        noun = "space" if resource_type == RESOURCE_SPACE else "project"
+        message = f"{from_name} invited you to join the {noun} {resource_name}"
+        message_i18n = json.dumps(
+            {
+                "i18nKey": i18n_key,
+                "context": {"fromUserName": from_name, "resourceName": resource_name},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        service = NotificationService()
+        for uid in recipients:
+            await service.create_and_push(
+                from_user_id=from_user_id,
+                to_user_id=uid,
+                notify_type="collaboratorInvite",
+                message=message,
+                message_i18n=message_i18n,
+                url_path=url_path,
+            )
 
     @staticmethod
     async def _validate_collaborator_users(user_ids: list[str]) -> None:
@@ -514,6 +567,7 @@ class CollaboratorService:
         rows: list[dict[str, Any]],
         user_map: dict[str, dict[str, Any]],
         options: dict[str, Any],
+        require_user: bool = True,
     ) -> list[dict[str, Any]]:
         include_system = options.get("includeSystem")
         search = (options.get("search") or "").lower()
@@ -522,18 +576,19 @@ class CollaboratorService:
         out = []
         for row in rows:
             user = user_map.get(row["principal_id"])
-            # whereNotNull('users.id'): rows whose principal is not a user drop out.
-            if user is None:
+            # whereNotNull('users.id'): the list/user views drop non-user rows;
+            # getTotalBase keeps them (leftJoin without the null filter).
+            if user is None and require_user:
                 continue
-            if not include_system and user.get("is_system"):
+            if not include_system and user is not None and user.get("is_system"):
                 continue
             if principal_type and row["principal_type"] != principal_type:
                 continue
             if roles and row["role_name"] not in roles:
                 continue
             if search:
-                name = user.get("name") or ""
-                email = user.get("email") or ""
+                name = (user or {}).get("name") or ""
+                email = (user or {}).get("email") or ""
                 if search not in name.lower() and search not in email.lower():
                     continue
             out.append(row)
@@ -551,6 +606,7 @@ class CollaboratorService:
             "createdTime": _iso(row["created_time"]),
             "lastSignTime": _iso(user.get("last_sign_time")),
             "resourceType": row["resource_type"],
+            "billable": True,
         }
         if user.get("is_system"):
             item["isSystem"] = True
@@ -571,7 +627,9 @@ class CollaboratorService:
 
     async def get_total_base(self, base_id: str, options: dict[str, Any]) -> int:
         _, rows, user_map = await self._base_tree_rows(base_id)
-        return len(self._filter_base_rows(rows, user_map, options))
+        # getTotalBase leftJoins users without whereNotNull, so non-user
+        # principals are counted too.
+        return len(self._filter_base_rows(rows, user_map, options, require_user=False))
 
     async def get_user_collaborators(
         self, base_id: str, options: dict[str, Any]
@@ -590,6 +648,7 @@ class CollaboratorService:
                 "name": user_map[row["principal_id"]]["name"],
                 "email": user_map[row["principal_id"]]["email"],
                 "avatar": _public_avatar(user_map[row["principal_id"]].get("avatar")),
+                "created_time": _iso(row["created_time"]),
             }
             for row in paged
         ]
@@ -601,9 +660,13 @@ class CollaboratorService:
         await self.validate_user_add_role(user_id, role, base_id, RESOURCE_BASE)
         user_ids = [c["principalId"] for c in collaborators if c["principalType"] == "user"]
         await self._validate_collaborator_users(user_ids)
-        return await self.create_base_collaborator(
+        result = await self.create_base_collaborator(
             collaborators=collaborators, base_id=base_id, role=role, created_by=user_id
         )
+        await self._notify_collaborator_invite(
+            user_id, user_ids, RESOURCE_BASE, base_id
+        )
+        return result
 
     async def create_base_collaborator(
         self,

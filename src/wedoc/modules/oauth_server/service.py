@@ -111,6 +111,19 @@ async def _list_secret_hashes(client_id: str) -> list[tuple[str, str]]:
     return [(r[0], r[1]) for r in rows]
 
 
+async def _touch_secret_last_used(secret_id: str) -> None:
+    # the client-password strategy stamps lastUsedTime on each successful auth.
+    from sqlalchemy import update
+
+    async with db_engine.session() as session:
+        await session.execute(
+            update(OAuthAppSecret)
+            .where(OAuthAppSecret.id == secret_id)
+            .values(last_used_time=datetime.now(UTC).replace(tzinfo=None))
+        )
+        await session.commit()
+
+
 async def _rotate_app_token(
     client_id: str, old_sign: str, secret_id: str | None, new_sign: str, expired: datetime
 ) -> bool:
@@ -355,6 +368,8 @@ class OAuthServerService:
         return {"immediate": False, "transactionId": transaction_id}
 
     async def get_decision_info(self, transaction_id: str) -> dict[str, Any]:
+        if not transaction_id:
+            raise ApiError("transaction_id is required", HttpErrorCode.VALIDATION_ERROR)
         cache = get_cache()
         tx = await cache.get(f"oauth:txn:{transaction_id}")
         if not tx:
@@ -376,10 +391,14 @@ class OAuthServerService:
     async def decision(
         self, transaction_id: str, allow: bool, user: dict[str, Any]
     ) -> str:
+        if not transaction_id:
+            raise ApiError("transaction_id is required", HttpErrorCode.VALIDATION_ERROR)
         cache = get_cache()
         tx = await cache.get(f"oauth:txn:{transaction_id}")
         if not tx:
             raise ApiError("Invalid transaction ID", HttpErrorCode.VALIDATION_ERROR)
+        if tx.get("userId") != user["id"]:
+            raise ApiError("Invalid user", HttpErrorCode.VALIDATION_ERROR)
         await cache.delete(f"oauth:txn:{transaction_id}")
         redirect_uri = tx["redirectUri"]
         if not allow:
@@ -452,6 +471,7 @@ class OAuthServerService:
                 raise OAuthTokenError("No secrets found for the given clientId", 401)
             for sid, secret_hash in secrets_rows:
                 if bcrypt.checkpw(client_secret.encode()[:72], secret_hash.encode()):
+                    await _touch_secret_last_used(sid)
                     return {
                         "type": "secret",
                         "name": app["name"],

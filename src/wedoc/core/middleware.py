@@ -7,9 +7,11 @@ Covers: request id (X-Request-Id), helmet v7 default security headers
 import uuid
 from typing import ClassVar
 
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 CSP = (
     "default-src 'self';base-uri 'self';font-src 'self' https: data:;"
@@ -31,6 +33,29 @@ SECURITY_HEADERS = {
     "X-Permitted-Cross-Domain-Policies": "none",
     "X-XSS-Protection": "0",
 }
+
+
+class JsonCharsetMiddleware:
+    """NestJS/Express emit `application/json; charset=utf-8`; Starlette omits the
+    charset. Rewrite the bare content-type on the response start message so every
+    JSON response (success and error, from any router) matches the contract."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(raw=message["headers"])
+                if headers.get("content-type") == "application/json":
+                    headers["content-type"] = "application/json; charset=utf-8"
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):

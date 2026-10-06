@@ -19,6 +19,22 @@ from .schemas import (
     UpdateStorageRo,
 )
 
+
+def _js_number(value: Any) -> Any:
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
+def _normalize_layout(layout: Any) -> Any:
+    # JSON.stringify renders whole x/y/w/h without a trailing .0; mirror it.
+    if not isinstance(layout, list):
+        return layout
+    return [
+        {k: (_js_number(v) if k in ("x", "y", "w", "h") else v) for k, v in item.items()}
+        if isinstance(item, dict)
+        else item
+        for item in layout
+    ]
+
 _MAX_SAFE_INTEGER = 9007199254740991
 _POS = "panel"
 
@@ -58,7 +74,7 @@ class PluginPanelService:
             plugin_map[p["id"]] = item
         out: dict[str, Any] = {"id": panel["id"], "name": panel["name"]}
         if panel["layout"]:
-            out["layout"] = json.loads(panel["layout"])
+            out["layout"] = _normalize_layout(json.loads(panel["layout"]))
         out["pluginMap"] = plugin_map
         return out
 
@@ -76,7 +92,7 @@ class PluginPanelService:
         )
         out: dict[str, Any] = {"id": row["id"]}
         if row["layout"]:
-            out["layout"] = json.loads(row["layout"])
+            out["layout"] = _normalize_layout(json.loads(row["layout"]))
         return out
 
     async def install(self, table_id: str, panel_id: str, ro: InstallRo) -> dict[str, Any]:
@@ -217,7 +233,7 @@ class PluginPanelService:
     ) -> dict[str, Any]:
         panel = await repository.get_panel(table_id, panel_id)
         if panel is None:
-            raise repository.panel_not_found()
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
         base_id = await repository.get_base_id(table_id)
         names = await repository.panel_names(table_id)
         new_name = get_uniq_name(ro.name or panel["name"], names)

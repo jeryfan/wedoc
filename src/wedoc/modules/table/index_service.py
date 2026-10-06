@@ -51,11 +51,9 @@ class TableIndexService:
     async def _table(self, table_id: str) -> dict[str, Any]:
         table = await field_repository.get_table_meta_by_id(table_id)
         if table is None:
-            raise ApiError(
-                f"Table {table_id} not found",
-                HttpErrorCode.NOT_FOUND,
-                {"localization": {"i18nKey": "httpErrors.table.notFound"}},
-            )
+            # ref reads the table via findUniqueOrThrow/findFirstOrThrow with no
+            # explicit catch; a missing row surfaces as an uncaught 500, not a 404.
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
         return table
 
     async def _search_fields(self, table_id: str) -> list[dict[str, Any]]:
@@ -97,7 +95,8 @@ class TableIndexService:
         await self._create_indexes(table_id)
 
     async def get_search_vector_status(self, table_id: str) -> dict[str, Any]:
-        await self._table(table_id)
+        # ref returns the disabled shape with no table lookup (the v2 tsvector reader
+        # is absent on single-PG), so a missing table still yields 200 disabled.
         return {
             "tableId": table_id,
             "state": "disabled",

@@ -99,10 +99,14 @@ async def frontend_catch_all(full_path: str, request: Request) -> Response:
     if origin is None and _proxied(full_path):
         origin = settings.wedoc_web_origin
     if origin is None:
+        # Express `Cannot <METHOD> <originalUrl>` includes the raw query string.
+        target = f"/{full_path}"
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
         return JSONResponse(
             status_code=404,
             content={
-                "message": f"Cannot {request.method} /{full_path}",
+                "message": f"Cannot {request.method} {target}",
                 "status": 404,
                 "code": "not_found",
             },

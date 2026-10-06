@@ -10,6 +10,7 @@ from wedoc.modules.base.schemas import (
     CreateBaseBody,
     ListBaseCollaboratorQuery,
     UpdateBaseBody,
+    UpdateBaseCollaboratorBody,
     UpdateOrderBody,
 )
 from wedoc.modules.base.service import _PERMISSION_ACTIONS
@@ -97,14 +98,31 @@ class TestAddBaseCollaboratorsBody:
         assert body.role == "creator"
 
 
+class TestUpdateBaseCollaboratorBody:
+    def test_owner_role_rejected(self):
+        with pytest.raises(ApiError) as exc:
+            zod_validate(
+                UpdateBaseCollaboratorBody,
+                {"principalId": "usrA", "principalType": "user", "role": "owner"},
+            )
+        assert 'expected one of "creator"|"editor"|"commenter"|"viewer"' in str(exc.value)
+
+    def test_creator_role_accepted(self):
+        body = zod_validate(
+            UpdateBaseCollaboratorBody,
+            {"principalId": "usrA", "principalType": "user", "role": "creator"},
+        )
+        assert body.role == "creator"
+
+
 class TestListBaseCollaboratorQuery:
     def test_defaults(self):
         query = zod_validate(ListBaseCollaboratorQuery, {})
         assert query.skip is None and query.take is None and query.role is None
 
     def test_role_list(self):
-        query = zod_validate(ListBaseCollaboratorQuery, {"role": ["editor", "viewer"]})
-        assert query.role == ["editor", "viewer"]
+        query = zod_validate(ListBaseCollaboratorQuery, {"role": ["owner", "editor", "viewer"]})
+        assert query.role == ["owner", "editor", "viewer"]
 
     def test_coerce_paging(self):
         query = zod_validate(ListBaseCollaboratorQuery, {"skip": "10", "take": "20"})
@@ -120,7 +138,14 @@ class TestPermissionActions:
     def test_prefix_coverage(self):
         for action in _PERMISSION_ACTIONS:
             prefix = action.split("|")[0]
-            assert prefix in {"table", "base", "automation", "app", "table_record_history"}
+            assert prefix in {
+                "table",
+                "base",
+                "automation",
+                "routine",
+                "app",
+                "table_record_history",
+            }
 
     def test_no_duplicates(self):
         assert len(set(_PERMISSION_ACTIONS)) == len(_PERMISSION_ACTIONS)

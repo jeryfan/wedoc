@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request, Response
 
 from ...core.errors import ApiError, HttpErrorCode
+from ...core.query import query_array, query_list
 from ...core.security.auth import allow_anonymous, auth_guard, permissions
 from ...core.security.permissions import permission_guard
 from .service import AggregationService
@@ -64,34 +65,63 @@ def _sort_items(raw: Any, name: str) -> list[dict[str, Any]] | None:
     return items
 
 
+_STATISTIC_FUNCS = frozenset(
+    {
+        "count",
+        "empty",
+        "filled",
+        "unique",
+        "max",
+        "min",
+        "sum",
+        "average",
+        "checked",
+        "unChecked",
+        "percentEmpty",
+        "percentFilled",
+        "percentUnique",
+        "percentChecked",
+        "percentUnChecked",
+        "earliestDate",
+        "latestDate",
+        "dateRangeOfDays",
+        "dateRangeOfMonths",
+        "totalAttachmentSize",
+    }
+)
+
+
 def _field_stats(params: Any) -> list[tuple[str, list[str]]] | None:
-    # bracketed record format: field[sum][]=fld... (array values required).
+    # z.partialRecord(z.enum(StatisticsFunc), z.string().array()): keys must be a
+    # known statistic func, values arrays. qs bracket forms: field[func][]=fld is
+    # the array, field[func]=fld a scalar the schema rejects. Per-entry issues are
+    # collected in query order and joined by "; ".
     stats: list[tuple[str, list[str]]] = []
-    seen: list[str] = []
+    processed: list[str] = []
+    issues: list[str] = []
     for key in params.keys():
         if not key.startswith("field["):
             continue
         rest = key[len("field[") :]
         if rest.endswith("][]"):
-            func = rest[:-3]
+            func, is_array = rest[:-3], True
         elif rest.endswith("]"):
-            raise ApiError(
-                f'Validation error: Invalid input: expected array, received string'
-                f' at "field.{rest[:-1]}"',
-                HttpErrorCode.VALIDATION_ERROR,
-            )
+            func, is_array = rest[:-1], False
         else:
             continue
-        if func in seen:
+        if func in processed:
             continue
-        seen.append(func)
-        values = params.getlist(key)
-        if any(not isinstance(v, str) for v in values):
-            raise ApiError(
-                'Validation error: Invalid input: expected array at "field"',
-                HttpErrorCode.VALIDATION_ERROR,
-            )
-        stats.append((func, list(values)))
+        processed.append(func)
+        if func not in _STATISTIC_FUNCS:
+            issues.append(f'Invalid key in record at "field.{func}"')
+        elif not is_array:
+            issues.append(f'Invalid input: expected array, received string at "field.{func}"')
+        else:
+            stats.append((func, list(params.getlist(key))))
+    if issues:
+        raise ApiError(
+            f"Validation error: {'; '.join(issues)}", HttpErrorCode.VALIDATION_ERROR
+        )
     if stats:
         return stats
     if "field" in params:
@@ -103,15 +133,11 @@ def _field_stats(params: Any) -> list[tuple[str, list[str]]] | None:
 
 
 def _search_param(params: Any) -> list[str] | None:
-    raw = params.getlist("search")
-    if not raw:
-        return None
-    if len(raw) < 2:
-        raise ApiError(
-            'Validation error: Invalid input: expected tuple, received string at "search"',
-            HttpErrorCode.VALIDATION_ERROR,
-        )
-    return list(raw)
+    # search is a zod tuple [value, field?, isExact?]; qs treats the bracket form
+    # `search[]=` as a tuple (valid even with one element) and a repeated plain
+    # key as a tuple, while a single plain `search=x` is a scalar the schema
+    # rejects with "expected tuple, received string".
+    return query_array(params, "search", expected="tuple")
 
 
 def _ignore_view_query(params: Any) -> bool:
@@ -135,6 +161,37 @@ def _int_param(params: Any, name: str) -> int | None:
             f'Validation error: Invalid input: expected number, received NaN at "{name}"',
             HttpErrorCode.VALIDATION_ERROR,
         ) from None
+
+
+def _bounded_int(params: Any, name: str, minimum: int, default: int | None) -> int | None:
+    # z.coerce.number().int().min(minimum)[.default(default)]: a missing value
+    # without a default coerces to NaN (required), and below-minimum values fail.
+    value = _int_param(params, name)
+    if value is None:
+        if default is None:
+            raise ApiError(
+                f'Validation error: Invalid input: expected number, received NaN at "{name}"',
+                HttpErrorCode.VALIDATION_ERROR,
+            )
+        return default
+    if value < minimum:
+        raise ApiError(
+            f'Validation error: Too small: expected number to be >={minimum} at "{name}"',
+            HttpErrorCode.VALIDATION_ERROR,
+        )
+    return value
+
+
+def _link_cell_param(params: Any, name: str) -> list[str] | str | None:
+    # zod tuple([fieldId, recordId]).or(fieldId): qs turns the bracket form
+    # `name[]=field&name[]=record` into the tuple, while a single plain param
+    # stays a bare field id.
+    raw = query_list(params, name)
+    if not raw:
+        return None
+    if len(raw) == 1:
+        return raw[0]
+    return [raw[0], raw[1]]
 
 
 @router.get("", status_code=200)
@@ -161,20 +218,16 @@ async def get_aggregation(tableId: str, request: Request) -> dict[str, Any]:
 async def get_row_count(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     filter_param, tql = _tql_or_filter(params)
-    selected = params.getlist("selectedRecordIds")
-    if "selectedRecordIds" in params and len(selected) < 2:
-        raise ApiError(
-            'Validation error: Invalid input: expected array, received string'
-            ' at "selectedRecordIds"',
-            HttpErrorCode.VALIDATION_ERROR,
-        )
     return await AggregationService().get_row_count(
         tableId,
         filter_param=filter_param,
         tql=tql,
         search=_search_param(params),
         view_id=params.get("viewId"),
-        selected_record_ids=selected or None,
+        selected_record_ids=query_array(params, "selectedRecordIds"),
+        filter_link_cell_candidate=_link_cell_param(params, "filterLinkCellCandidate"),
+        filter_link_cell_selected=_link_cell_param(params, "filterLinkCellSelected"),
+        projection=query_array(params, "projection"),
         ignore_view_query=_ignore_view_query(params),
     )
 
@@ -269,9 +322,11 @@ async def get_calendar_daily_collection(tableId: str, request: Request) -> dict[
         if not params.get(name)
     ]
     if missing:
+        issues = "; ".join(
+            f'Invalid input: expected string, received undefined at "{name}"' for name in missing
+        )
         raise ApiError(
-            f'Validation error: Invalid input: expected string, received undefined'
-            f' at "{missing[0]}"',
+            f"Validation error: {issues}",
             HttpErrorCode.VALIDATION_ERROR,
         )
     return await AggregationService().get_calendar_daily_collection(
@@ -302,8 +357,9 @@ async def get_selection_aggregation(tableId: str, request: Request) -> dict[str,
         view_id=params.get("viewId"),
         order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy"), "orderBy"),
         group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy"), "groupBy"),
-        skip=_int_param(params, "skip") or 0,
-        take=_int_param(params, "take"),
+        collapsed_ids=_json_param(params.get("collapsedGroupIds"), "collapsedGroupIds"),
+        skip=_bounded_int(params, "skip", minimum=0, default=0),
+        take=_bounded_int(params, "take", minimum=1, default=None),
         ignore_view_query=_ignore_view_query(params),
     )
 

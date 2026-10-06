@@ -41,4 +41,8 @@ async def health() -> JSONResponse:
 
 @router.get("/health/memory")
 async def health_memory() -> dict:
-    return {"memoryUsage": memory_usage(), "pod": os.environ.get("HOSTNAME")}
+    body: dict = {"memoryUsage": memory_usage()}
+    pod = os.environ.get("HOSTNAME")
+    if pod is not None:
+        body["pod"] = pod
+    return body

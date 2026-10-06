@@ -155,16 +155,21 @@ class V2Service:
 
     async def update_records(self, payload: dict[str, Any]) -> dict[str, Any]:
         table_id = payload["tableId"]
-        records_in = payload["records"]
-        field_key_type = payload.get("fieldKeyType", "name")
-        body = RecordBulkPatchBody(
-            records=[
+        field_key_type = payload.get("fieldKeyType") or "id"
+        records_in = payload.get("records")
+        if records_in is not None:
+            items = [
                 RecordBulkPatchItem(id=r["id"], fields=r.get("fields") or {})
                 for r in records_in
-            ],
-            fieldKeyType=field_key_type,
-        )
-        record_ids = [r["id"] for r in records_in]
+            ]
+            record_ids = [r["id"] for r in records_in]
+        elif payload.get("recordIds") is not None:
+            shared_fields = payload.get("fields") or {}
+            record_ids = list(payload["recordIds"])
+            items = [RecordBulkPatchItem(id=rid, fields=shared_fields) for rid in record_ids]
+        else:
+            raise V2Error(400, "filter-based updateRecords is not supported")
+        body = RecordBulkPatchBody(records=items, fieldKeyType=field_key_type)
         try:
             results = await RecordService().update_records(table_id, record_ids, body)
         except Exception as error:

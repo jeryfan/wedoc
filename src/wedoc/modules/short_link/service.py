@@ -14,15 +14,23 @@ async def _resolve_target_path(link_type: str, resource_id: str) -> str:
             raise ApiError("Share view not found", HttpErrorCode.NOT_FOUND)
         return f"/share/{resource_id}/view"
     if link_type == "base-share":
-        if not await repository.base_share_exists(resource_id):
-            raise ApiError("Base share not found", HttpErrorCode.NOT_FOUND)
-        return f"/share/{resource_id}/base"
+        from ..base_share.service import BaseShareService
+
+        target = await repository.base_share_target(resource_id)
+        if target is None:
+            raise ApiError("Project share not found", HttpErrorCode.NOT_FOUND)
+        default_url = await BaseShareService()._build_default_url(
+            target["baseId"], target["nodeId"]
+        )
+        return f"/share/{resource_id}{default_url}" if default_url else f"/share/{resource_id}/base"
     if link_type == "template":
         if not await repository.template_published(resource_id):
             raise ApiError("Template not found", HttpErrorCode.NOT_FOUND)
         return f"/t/{resource_id}"
-    # No external resolver is registered (EE-only artifact shares).
-    raise ApiError("Unsupported short link type", HttpErrorCode.VALIDATION_ERROR)
+    # artifact shares are an enterprise-only resource with no backing store here,
+    # so their external resolver always reports the target as gone (404), matching
+    # the reference's null-resolver path rather than the no-resolver 400.
+    raise ApiError("Short link target not found", HttpErrorCode.NOT_FOUND)
 
 
 class ShortLinkService:
@@ -41,3 +49,11 @@ class ShortLinkService:
             raise ApiError("Short link not found", HttpErrorCode.NOT_FOUND)
         path = await _resolve_target_path(short_link["type"], short_link["resourceId"])
         return {"code": short_link["code"], "path": path}
+
+    async def mark_deleted_by_resource(self, link_type: str, resource_id: str) -> None:
+        try:
+            await repository.mark_deleted_by_resource(link_type, resource_id)
+        except Exception:
+            # Advisory bookkeeping: link validity is enforced at redirect time,
+            # so marking must never fail the caller's main operation.
+            pass

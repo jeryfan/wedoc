@@ -129,12 +129,15 @@ class AiService:
             "gatewayModels": config.get("gatewayModels"),
             "attachmentTransferMode": config.get("attachmentTransferMode"),
         }
-        # Omit undefined (None) keys, and prune per-provider undefined keys, to
-        # match JSON.stringify dropping undefined fields.
+        # Omit undefined (None) keys, and prune nested (per-provider, chatModel)
+        # undefined keys, to match JSON.stringify dropping undefined fields.
         simplified["llmProviders"] = [
             {k: v for k, v in provider.items() if v is not None}
             for provider in simplified["llmProviders"]
         ]
+        chat_model = simplified.get("chatModel")
+        if isinstance(chat_model, dict):
+            simplified["chatModel"] = {k: v for k, v in chat_model.items() if v is not None}
         return {k: v for k, v in simplified.items() if v is not None}
 
     async def get_ai_disable_ai_actions(self, base_id: str) -> dict[str, Any]:

@@ -130,6 +130,7 @@ class ViewPluginService:
                     },
                 }
             ),
+            install_plugin=False,
         )
         async with db_engine.session() as session:
             await session.execute(

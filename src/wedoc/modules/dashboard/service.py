@@ -18,6 +18,22 @@ from .schemas import (
 )
 
 _MAX_SAFE_INTEGER = 9007199254740991
+
+
+def _js_number(value: Any) -> Any:
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
+def _normalize_layout(layout: Any) -> Any:
+    # JSON.stringify renders whole x/y/w/h without a trailing .0; mirror it.
+    if not isinstance(layout, list):
+        return layout
+    return [
+        {k: (_js_number(v) if k in ("x", "y", "w", "h") else v) for k, v in item.items()}
+        if isinstance(item, dict)
+        else item
+        for item in layout
+    ]
 _PLUGIN_POSITION_DASHBOARD = "dashboard"
 
 
@@ -47,7 +63,7 @@ class DashboardService:
         }
         out: dict[str, Any] = {"id": dashboard["id"], "name": dashboard["name"]}
         if dashboard["layout"]:
-            out["layout"] = json.loads(dashboard["layout"])
+            out["layout"] = _normalize_layout(json.loads(dashboard["layout"]))
         out["pluginMap"] = plugin_map
         return out
 
@@ -66,7 +82,7 @@ class DashboardService:
         row = await repository.update_layout(base_id, dashboard_id, json.dumps(layout))
         out: dict[str, Any] = {"id": row["id"], "name": row["name"]}
         if row["layout"]:
-            out["layout"] = json.loads(row["layout"])
+            out["layout"] = _normalize_layout(json.loads(row["layout"]))
         return out
 
     async def delete_dashboard(self, base_id: str, dashboard_id: str) -> None:
@@ -93,7 +109,7 @@ class DashboardService:
             exist = await repository.base_collaborator_count(plugin["pluginUser"], base_id)
             if not exist:
                 await self._invite_plugin_user(base_id, plugin["pluginUser"], user_id)
-        layout_json = await repository.get_layout(base_id, dashboard_id)
+        layout_json = await repository.get_layout_or_500(base_id, dashboard_id)
         layout = json.loads(layout_json) if layout_json else []
         layout.append(
             {
@@ -130,7 +146,7 @@ class DashboardService:
     async def remove_plugin(self, base_id: str, dashboard_id: str, plugin_install_id: str) -> None:
         user_id = cls.get("user.id")
         await repository.delete_install(base_id, dashboard_id, plugin_install_id, user_id)
-        layout_json = await repository.get_layout(base_id, dashboard_id)
+        layout_json = await repository.get_layout_or_500(base_id, dashboard_id)
         layout = json.loads(layout_json) if layout_json else []
         new_layout = [i for i in layout if i.get("pluginInstallId") != plugin_install_id]
         if len(new_layout) != len(layout):
@@ -187,7 +203,7 @@ class DashboardService:
     async def duplicate_dashboard(
         self, base_id: str, dashboard_id: str, ro: DuplicateDashboardRo
     ) -> dict[str, Any]:
-        source = await repository.get_dashboard(base_id, dashboard_id)
+        source = await repository.get_dashboard_or_500(base_id, dashboard_id)
         names = await repository.dashboard_names(base_id)
         new_name = get_uniq_name(ro.name or source["name"], names)
         new_dashboard_id = _dashboard_id()

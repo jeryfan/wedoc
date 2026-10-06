@@ -440,11 +440,11 @@ def test_get_permissions_matches_matrix_complement():
         # every granted action is a known action; owner lacks only instance/enterprise
         denied = {"instance|read", "instance|update", "enterprise|read", "enterprise|update"}
         assert perms.isdisjoint(denied)
-    assert len(get_permissions(Role.OWNER)) == 57
-    assert len(get_permissions(Role.CREATOR)) == 52
-    assert len(get_permissions(Role.EDITOR)) == 31
-    assert len(get_permissions(Role.COMMENTER)) == 17
-    assert len(get_permissions(Role.VIEWER)) == 17
+    assert len(get_permissions(Role.OWNER)) == 61
+    assert len(get_permissions(Role.CREATOR)) == 56
+    assert len(get_permissions(Role.EDITOR)) == 32
+    assert len(get_permissions(Role.COMMENTER)) == 18
+    assert len(get_permissions(Role.VIEWER)) == 18
 
 
 def test_check_permissions_and_restricted():

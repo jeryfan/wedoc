@@ -45,6 +45,14 @@ async def get_table_meta_row(
     return _row(row) if row else None
 
 
+async def table_exists_by_id(table_id: str) -> bool:
+    async with db_engine.session() as session:
+        stmt = select(TableMeta.id).where(
+            TableMeta.id == table_id, TableMeta.deleted_time.is_(None)
+        )
+        return (await session.execute(stmt)).scalars().first() is not None
+
+
 async def list_next_table_by_order(
     base_id: str, anchor_order: float, *, below: bool
 ) -> dict[str, Any] | None:

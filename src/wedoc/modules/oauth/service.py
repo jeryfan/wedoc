@@ -90,15 +90,21 @@ class OAuthService:
 
     async def update_oauth(self, client_id: str, ro: OAuthCreateRo) -> dict[str, Any]:
         await self._validate_ownership(client_id)
+        # An omitted optional field must preserve the stored value (Prisma skips
+        # `undefined`); only columns present in the request body are written.
+        provided = ro.model_fields_set
         values: dict[str, Any] = {
             "name": ro.name,
-            "description": ro.description,
-            "scopes": json.dumps(ro.scopes) if ro.scopes else None,
             "homepage": ro.homepage,
-            "logo": ro.logo,
             "redirect_uris": json.dumps(ro.redirectUris) if ro.redirectUris else None,
         }
-        if ro.allowDeviceFlow is not None:
+        if "description" in provided:
+            values["description"] = ro.description
+        if "logo" in provided:
+            values["logo"] = ro.logo
+        if "scopes" in provided:
+            values["scopes"] = json.dumps(ro.scopes) if ro.scopes else None
+        if "allowDeviceFlow" in provided:
             values["allow_device_flow"] = ro.allowDeviceFlow
         row = await repository.update_app(client_id, values)
         return _convert_to_vo(
@@ -117,7 +123,8 @@ class OAuthService:
         creators = [user_id]
         if cls.get("user.isAdmin"):
             creators = [user_id, SYSTEM_USER_ID]
-        return await repository.list_apps({"created_by": creators})
+        rows = await repository.list_apps({"created_by": creators})
+        return [_convert_to_vo(row) for row in rows]
 
     async def generate_secret(self, client_id: str) -> dict[str, Any]:
         await self._validate_ownership(client_id)

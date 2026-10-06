@@ -31,6 +31,23 @@ class IdReturnType:
     ALL = "all"
 
 
+_SELECT_TYPES = ("singleSelect", "multipleSelect")
+
+
+def _copy_header(fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The clipboard header is the reference's field-instance serialization: it
+    always carries isMultipleCellValue (the field VO omits it when false), and a
+    select instance also exposes its (empty, lazily-filled) choice-lookup cache."""
+    header: list[dict[str, Any]] = []
+    for f in fields:
+        item = {**f, "isMultipleCellValue": bool(f.get("isMultipleCellValue"))}
+        if item.get("type") in _SELECT_TYPES:
+            item["_innerChoicesMap"] = {}
+            item["_innerChoicesMapKey"] = ""
+        header.append(item)
+    return header
+
+
 class SelectionService:
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -217,11 +234,7 @@ class SelectionService:
         rectangle = [
             [_cv_to_string(f, r["fields"].get(f["id"])) for f in fields] for r in records
         ]
-        header = [dict(f) for f in fields]
-        for f in header:
-            # copy header uses the full field VO which always carries the flag
-            f.setdefault("isMultipleCellValue", False)
-        return {"content": stringify_clipboard_text(rectangle), "header": header}
+        return {"content": stringify_clipboard_text(rectangle), "header": _copy_header(fields)}
 
     # -- clear -----------------------------------------------------------------
     async def clear(
@@ -284,6 +297,9 @@ class SelectionService:
             search=None,
             view_id=query.get("viewId"),
             selected_record_ids=None,
+            filter_link_cell_candidate=None,
+            filter_link_cell_selected=None,
+            projection=None,
             ignore_view_query=bool(query.get("ignoreViewQuery")),
         )
         return result["rowCount"]
@@ -513,13 +529,25 @@ class SelectionService:
         rectangle = [
             [_cv_to_string(f, r["fields"].get(f["id"])) for f in fields] for r in records
         ]
-        return {"content": stringify_clipboard_text(rectangle), "header": fields}
+        return {"content": stringify_clipboard_text(rectangle), "header": _copy_header(fields)}
 
     async def clear_by_id(
         self, table_id: str, body: dict[str, Any], window_id: str | None
     ) -> list[str]:
         record_ids = await self._resolve_record_ids(table_id, body)
         fields = await self._resolve_fields(table_id, body)
+        return await self._clear_resolved(table_id, record_ids, fields)
+
+    async def clear_by_ids(
+        self, table_id: str, body: dict[str, Any], window_id: str | None
+    ) -> list[str]:
+        record_ids = await self._resolve_record_ids_from_ids(table_id, body)
+        fields = await self._resolve_fields_from_ids(table_id, body)
+        return await self._clear_resolved(table_id, record_ids, fields)
+
+    async def _clear_resolved(
+        self, table_id: str, record_ids: list[str], fields: list[dict[str, Any]]
+    ) -> list[str]:
         field_ids = [f["id"] for f in fields]
         records = await self._records_by_ids(table_id, record_ids, field_ids)
         if not records:
@@ -542,6 +570,13 @@ class SelectionService:
         self, table_id: str, body: dict[str, Any], window_id: str | None
     ) -> dict[str, Any]:
         record_ids = await self._resolve_record_ids(table_id, body)
+        await RecordService().delete_records(table_id, record_ids)
+        return {"ids": record_ids}
+
+    async def delete_by_ids(
+        self, table_id: str, body: dict[str, Any], window_id: str | None
+    ) -> dict[str, Any]:
+        record_ids = await self._resolve_record_ids_from_ids(table_id, body)
         await RecordService().delete_records(table_id, record_ids)
         return {"ids": record_ids}
 
@@ -657,6 +692,33 @@ class SelectionService:
             by_id = {f["id"]: f for f in all_fields}
             return [by_id[fid] for fid in body["projection"] if fid in by_id]
         return await self._visible_fields(table_id, body.get("viewId"), None)
+
+    async def _resolve_record_ids_from_ids(
+        self, table_id: str, body: dict[str, Any]
+    ) -> list[str]:
+        selection = body.get("selection") or {}
+        excluded = set(selection.get("excludedRecordIds") or [])
+        if selection.get("allRecords"):
+            all_ids = await self._all_record_ids(table_id, body)
+            return [rid for rid in all_ids if rid not in excluded]
+        record_ids = selection.get("recordIds") or []
+        return [rid for rid in record_ids if rid not in excluded]
+
+    async def _resolve_fields_from_ids(
+        self, table_id: str, body: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        selection = body.get("selection") or {}
+        field_ids = selection.get("fieldIds")
+        if not selection.get("allFields") and field_ids:
+            excluded = set(selection.get("excludedFieldIds") or [])
+            all_fields = await FieldService().list_fields(table_id)
+            by_id = {f["id"]: f for f in all_fields}
+            return [
+                by_id[fid] for fid in field_ids if fid in by_id and fid not in excluded
+            ]
+        return await self._visible_fields(
+            table_id, body.get("viewId"), body.get("projection")
+        )
 
     async def _records_by_ids(
         self, table_id: str, record_ids: list[str], field_ids: list[str]

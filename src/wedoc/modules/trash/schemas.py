@@ -2,6 +2,8 @@
 
 from ...core.validation import ZodEnumStr, ZodModel
 
+TableTrashTypeStr = ZodEnumStr(["view", "field", "record"])
+
 
 class TrashRo(ZodModel):
     spaceId: str | None = None
@@ -13,3 +15,7 @@ class TrashItemsRo(ZodModel):
     resourceType: ZodEnumStr(["base", "table"])
     cursor: str | None = None
     pageSize: int | None = None
+    resourceTypes: list[TableTrashTypeStr] | None = None
+    deletedBy: list[str] | None = None
+    deletedTimeStart: str | None = None
+    deletedTimeEnd: str | None = None

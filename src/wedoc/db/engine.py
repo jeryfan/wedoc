@@ -1,5 +1,7 @@
 """Async database engines and pools (meta / data / BYODB custom)."""
 
+import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -20,6 +22,12 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 async def init_db() -> None:
     global _meta_engine, _meta_pool, _session_factory
+    # wedoc stores timestamps as naive UTC; asyncpg converts a naive datetime bound
+    # to a timestamptz using the *process* local timezone, which would shift stored
+    # times on a non-UTC host. Pin the process to UTC so storage stays correct
+    # regardless of the host/container timezone (production images already run UTC).
+    os.environ["TZ"] = "UTC"
+    time.tzset()
     settings = get_settings()
     _meta_engine = create_async_engine(
         settings.sqlalchemy_dsn,

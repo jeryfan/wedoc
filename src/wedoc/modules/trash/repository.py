@@ -10,12 +10,14 @@ from ...db import engine as db_engine
 from ...db.models_meta import (
     Base,
     Collaborator,
+    Field,
     RecordTrash,
     Space,
     TableMeta,
     TableTrash,
     Trash,
     User,
+    View,
 )
 
 _OWNER_CREATOR = ("owner", "creator")
@@ -27,6 +29,13 @@ def _iso(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _to_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).replace(tzinfo=None)
 
 
 async def upsert_trash(
@@ -258,7 +267,9 @@ async def restore_table(table_id: str) -> dict[str, Any] | None:
         if base_id is None:
             return None
         await session.execute(
-            update(TableMeta).where(TableMeta.id == table_id).values(deleted_time=None)
+            update(TableMeta)
+            .where(TableMeta.id == table_id)
+            .values(deleted_time=None, provision_state="ready")
         )
         await session.commit()
     return {"baseId": base_id}
@@ -337,7 +348,13 @@ async def insert_record_trash(rows: list[dict[str, Any]]) -> None:
 
 
 async def list_table_trash(
-    table_id: str, cursor: str | None, limit: int, resource_types: list[str] | None
+    table_id: str,
+    cursor: str | None,
+    limit: int,
+    resource_types: list[str] | None,
+    deleted_by: list[str] | None,
+    deleted_time_start: str | None,
+    deleted_time_end: str | None,
 ) -> list[dict[str, Any]]:
     async with db_engine.session() as session:
         cursor_time = None
@@ -350,6 +367,12 @@ async def list_table_trash(
         stmt = select(TableTrash).where(TableTrash.table_id == table_id)
         if resource_types:
             stmt = stmt.where(TableTrash.resource_type.in_(resource_types))
+        if deleted_by:
+            stmt = stmt.where(TableTrash.created_by.in_(deleted_by))
+        if deleted_time_start:
+            stmt = stmt.where(TableTrash.created_time >= _to_datetime(deleted_time_start))
+        if deleted_time_end:
+            stmt = stmt.where(TableTrash.created_time <= _to_datetime(deleted_time_end))
         if cursor_time is not None:
             stmt = stmt.where(TableTrash.created_time < cursor_time)
         stmt = stmt.order_by(TableTrash.created_time.desc()).limit(limit)
@@ -388,6 +411,29 @@ async def find_table_trash(trash_id: str, table_id: str) -> dict[str, Any] | Non
     }
 
 
+async def delete_table_trash(trash_id: str, table_id: str) -> None:
+    async with db_engine.session() as session:
+        await session.execute(
+            delete(TableTrash).where(
+                TableTrash.id == trash_id, TableTrash.table_id == table_id
+            )
+        )
+        await session.commit()
+
+
+async def delete_record_trash(table_id: str, record_ids: list[str]) -> None:
+    if not record_ids:
+        return
+    async with db_engine.session() as session:
+        await session.execute(
+            delete(RecordTrash).where(
+                RecordTrash.table_id == table_id,
+                RecordTrash.record_id.in_(record_ids),
+            )
+        )
+        await session.commit()
+
+
 async def list_record_trash(table_id: str, record_ids: list[str]) -> list[dict[str, Any]]:
     if not record_ids:
         return []
@@ -409,6 +455,49 @@ async def list_record_trash(table_id: str, record_ids: list[str]) -> list[dict[s
             "snapshot": r.snapshot,
             "createdTime": r.created_time,
             "createdBy": r.created_by,
+        }
+        for r in rows
+    ]
+
+
+async def list_deleted_views(view_ids: list[str]) -> list[dict[str, Any]]:
+    if not view_ids:
+        return []
+    async with db_engine.session() as session:
+        rows = (
+            await session.execute(
+                select(View.id, View.name, View.type).where(
+                    View.id.in_(view_ids), View.deleted_time.is_not(None)
+                )
+            )
+        ).all()
+    return [{"id": r[0], "name": r[1], "type": r[2]} for r in rows]
+
+
+async def list_deleted_fields(field_ids: list[str]) -> list[dict[str, Any]]:
+    if not field_ids:
+        return []
+    async with db_engine.session() as session:
+        rows = (
+            await session.execute(
+                select(
+                    Field.id,
+                    Field.name,
+                    Field.type,
+                    Field.options,
+                    Field.is_lookup,
+                    Field.is_conditional_lookup,
+                ).where(Field.id.in_(field_ids), Field.deleted_time.is_not(None))
+            )
+        ).all()
+    return [
+        {
+            "id": r[0],
+            "name": r[1],
+            "type": r[2],
+            "options": r[3],
+            "isLookup": r[4],
+            "isConditionalLookup": r[5],
         }
         for r in rows
     ]

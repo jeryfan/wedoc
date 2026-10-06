@@ -16,7 +16,7 @@ from sqlalchemy import delete, func, select, text
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.ids import IdPrefix, new_id, random_string
-from ...core.security.permissions import get_max_level_role
+from ...core.security.permissions import Role, get_max_level_role
 from ...core.storage import get_public_full_storage_url
 from ...db import engine as db_engine
 from ...db.models_meta import (
@@ -74,6 +74,10 @@ _PERMISSION_ACTIONS: tuple[str, ...] = (
     "automation|delete",
     "automation|read",
     "automation|update",
+    "routine|create",
+    "routine|delete",
+    "routine|read",
+    "routine|update",
     "app|create",
     "app|delete",
     "app|read",
@@ -84,10 +88,70 @@ _PERMISSION_ACTIONS: tuple[str, ...] = (
 
 def _not_found() -> ApiError:
     return ApiError(
-        "Base not found",
+        "Project not found",
         HttpErrorCode.NOT_FOUND,
         {"localization": {"i18nKey": "httpErrors.base.notFound"}},
     )
+
+
+# fields held back from duplication's scalar pass and re-provisioned later so
+# their references remap into the new base: link fields in pass 2, lookup/rollup/
+# formula in pass 4. conditionalRollup / conditional lookups have no create path
+# in wedoc (a source base can't contain one) and stay dropped.
+_DEFERRED_COMPUTED_TYPES = {"formula", "rollup", "conditionalRollup"}
+
+
+def _is_link_or_computed(field: dict[str, Any]) -> bool:
+    return (
+        field["type"] == "link"
+        or field["type"] in _DEFERRED_COMPUTED_TYPES
+        or bool(field.get("isLookup"))
+        or bool(field.get("isConditionalLookup"))
+    )
+
+
+def _remap_formula_expression(expression: str, field_map: dict[str, str]) -> str:
+    """Rewrite ``{fldXxx}`` id tokens via field_map, skipping ids inside string
+    literals and comments (mirrors the formula lexer's scanning)."""
+    out: list[str] = []
+    i, n = 0, len(expression)
+    while i < n:
+        ch = expression[i]
+        if ch == "/" and i + 1 < n and expression[i + 1] == "/":
+            j = i + 2
+            while j < n and expression[j] not in "\r\n":
+                j += 1
+            out.append(expression[i:j])
+            i = j
+        elif ch == "/" and i + 1 < n and expression[i + 1] == "*":
+            end = expression.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+            out.append(expression[i:end])
+            i = end
+        elif ch in "'\"":
+            j = i + 1
+            while j < n:
+                if expression[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if expression[j] == ch:
+                    j += 1
+                    break
+                j += 1
+            out.append(expression[i:j])
+            i = j
+        elif ch == "{":
+            end = expression.find("}", i + 1)
+            if end == -1:
+                out.append(expression[i:])
+                break
+            inner = expression[i + 1 : end].strip()
+            out.append("{" + field_map.get(inner, inner) + "}")
+            i = end + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 class BaseService:
@@ -159,7 +223,13 @@ class BaseService:
         base = await repository.get_base_row(base_id)
         if base is None:
             raise _not_found()
-        role, collaborator_type = await self._role_by_base_id(base_id, base["space_id"])
+        template = cls.get("template")
+        base_share = cls.get("baseShare")
+        if template or base_share:
+            role: str = Role.VIEWER
+            collaborator_type = RESOURCE_BASE
+        else:
+            role, collaborator_type = await self._role_by_base_id(base_id, base["space_id"])
         result: dict[str, Any] = {
             "id": base["id"],
             "name": base["name"],
@@ -168,7 +238,16 @@ class BaseService:
             "createdBy": base["created_by"],
             "role": role,
             "collaboratorType": collaborator_type,
+            "enabledAuthority": False,
+            "restrictedAuthority": False,
         }
+        if template and template.get("baseId") == base_id:
+            from ...core.security.permissions import PermissionService
+
+            result["template"] = {
+                "id": template["id"],
+                "headers": PermissionService().generate_template_header(template["id"]),
+            }
         if base.get("v2_enabled"):
             result["v2Status"] = {"useV2": True, "reason": "new_base"}
         return result
@@ -253,11 +332,15 @@ class BaseService:
         }
 
     async def check_move_base(
-        self, base_id: str, target_space_id: str
+        self, base_id: str, target_space_id: str | None
     ) -> dict[str, Any]:
         base = await repository.get_base_row(base_id)
         if base is None or base["deleted_time"] is not None:
             raise _not_found()
+        # The reference's query schema requires spaceId; when it is absent the
+        # controller passes undefined downstream and throws an unhandled 500.
+        if not target_space_id:
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
         # No cross-space link fields in wedoc → no affected fields; the single
         # shared PG always resolves to the same (meta-fallback) data database.
         return {"affectedFields": [], "dataDb": self._data_db_check()}
@@ -281,14 +364,53 @@ class BaseService:
     async def create_base_from_template(
         self, space_id: str, template_id: str, with_records: bool, base_id: str | None
     ) -> dict[str, Any]:
-        # The template store (published template snapshots) is an M6 feature and
-        # has no table in wedoc yet. The reference resolves the template via
-        # prisma.template.findUniqueOrThrow, which for any non-existent id raises
-        # an unmapped Prisma error → 500. With no template store, every call here
-        # matches that 500; real template application lands with M6.
-        raise RuntimeError(
-            f"template store not available (M6): templateId={template_id}"
+        from ..template import repository as template_repository
+
+        # ref createBaseFromTemplate: findUniqueOrThrow(template) → 500 for an unknown
+        # id; an existing template whose snapshot has no baseId → 404. The template's
+        # snapshot.baseId is the source base that gets duplicated into the space.
+        template = await template_repository.get_template_or_500(template_id)
+        if base_id is not None:
+            target = await repository.get_base_row(base_id)
+            if target is None or target["deleted_time"] is not None:
+                raise _not_found()
+            if target["space_id"] != space_id:
+                raise ApiError(
+                    "BaseId and spaceId mismatch",
+                    HttpErrorCode.VALIDATION_ERROR,
+                    {
+                        "localization": {
+                            "i18nKey": "httpErrors.base.baseAndSpaceMismatch",
+                            "context": {"baseId": base_id, "spaceId": space_id},
+                        }
+                    },
+                )
+        snapshot_raw = template.get("snapshot")
+        from_base_id = ""
+        if snapshot_raw:
+            try:
+                from_base_id = (json.loads(snapshot_raw) or {}).get("baseId") or ""
+            except (TypeError, ValueError):
+                from_base_id = ""
+        if not from_base_id:
+            raise ApiError(
+                "Template not found",
+                HttpErrorCode.NOT_FOUND,
+                {
+                    "localization": {
+                        "i18nKey": "httpErrors.base.templateNotFound",
+                        "context": {"templateId": template_id},
+                    }
+                },
+            )
+        # base_id None → provision a fresh base; base_id set → ADD the template's
+        # tables into that existing base (apply-into-existing). Both bump usageCount.
+        result = await self.duplicate_base_impl(
+            from_base_id, space_id, with_records, template.get("name"), target_base_id=base_id
         )
+        new_count = (template.get("usageCount") or 0) + 1
+        await template_repository.update_template_row(template_id, {"usage_count": new_count})
+        return result
 
     async def duplicate_base(
         self,
@@ -301,7 +423,9 @@ class BaseService:
 
         source = await repository.get_base_row(from_base_id)
         if source is None or source["deleted_time"] is not None:
-            raise _not_found()
+            # ref duplicateBase: findUniqueOrThrow surfaces a bare
+            # "Project {id} not found" (no localization data).
+            raise ApiError(f"Project {from_base_id} not found", HttpErrorCode.NOT_FOUND)
         # ref: base|update on the source. The share-copy path skips this (share
         # grants access) and calls duplicate_base_impl directly.
         await PermissionService().valid_permissions(
@@ -315,10 +439,17 @@ class BaseService:
         space_id: str,
         with_records: bool,
         name: str | None,
+        target_base_id: str | None = None,
     ) -> dict[str, Any]:
         from types import SimpleNamespace
 
+        from ...formula import FormulaError, reference_field_ids
+        from ...formula import parse as parse_formula
+        from ..field import link_field
+        from ..field.schemas import FieldCreateBody, FieldPatchBody
         from ..field.service import FieldService
+        from ..record.link_cells import link_input_ids
+        from ..record.schemas import RecordBulkPatchBody
         from ..record.service import RecordService
         from ..table import repository as table_repository
         from ..table.service import TableService
@@ -327,17 +458,46 @@ class BaseService:
         if source is None or source["deleted_time"] is not None:
             raise _not_found()
 
-        new_name = name or f"{source['name']} (Copy)"
-        new_base = await self.create_base(space_id, new_name, source.get("icon"))
-        new_base_id = new_base["id"]
+        if target_base_id is not None:
+            # apply-into-existing: reuse the pre-existing target base and ADD the
+            # template's tables alongside whatever it already holds (v2 allows
+            # duplicate table names — no dedup, no clear). The reference's exact v2
+            # merge/clear semantics live in a large baseDuplicate service and can't be
+            # oracle-verified here, so ADD is a documented approximation.
+            target = await repository.get_base_row(target_base_id)
+            if target is None or target["deleted_time"] is not None:
+                raise _not_found()
+            new_base_id = target_base_id
+            result_name, result_space_id, result_icon = (
+                target["name"],
+                target["space_id"],
+                target.get("icon"),
+            )
+        else:
+            new_name = name or f"{source['name']} (Copy)"
+            new_base = await self.create_base(space_id, new_name, source.get("icon"))
+            new_base_id = new_base["id"]
+            result_name, result_space_id, result_icon = new_name, space_id, source.get("icon")
 
         table_service = TableService()
         field_service = FieldService()
         record_service = RecordService()
 
+        table_map: dict[str, str] = {}
+        field_map: dict[str, str] = {}
+        record_map: dict[str, str] = {}
+        src_field_by_id: dict[str, dict[str, Any]] = {}
+        plans: list[dict[str, Any]] = []
+        # pass 1: recreate each table with its scalar/system fields, views and
+        # records. Link/computed fields are held back so every target table exists
+        # before links are provisioned; columnMeta is regenerated against the new
+        # field ids (custom widths/hidden flags are not preserved).
         tables = await table_service.list_tables(from_base_id)
         for table in tables:
             fields = await field_service.list_fields(table["id"])
+            for f in fields:
+                src_field_by_id[f["id"]] = f
+            excluded = {f["name"] for f in fields if _is_link_or_computed(f)}
             field_ros = [
                 {
                     "name": f["name"],
@@ -349,35 +509,232 @@ class BaseService:
                     "unique": f.get("unique") or False,
                 }
                 for f in fields
+                if not _is_link_or_computed(f)
             ]
             view_rows = await table_repository.list_view_rows(table["id"])
-            # columnMeta references source field ids; omitted here so create_table
-            # regenerates it against the new field ids (matches the reference for
-            # default views — custom column widths/hidden flags are not preserved,
-            # a documented simplification since wedoc has no link/computed fields).
             view_ros = [{"name": v["name"], "type": v["type"]} for v in view_rows]
+            src_records: list[dict[str, Any]] = []
             record_ros: list[dict[str, Any]] = []
             if with_records:
                 data = await record_service.list_records(
                     table["id"], field_key_type="name", take=100000
                 )
-                record_ros = [{"fields": r["fields"]} for r in data["records"]]
+                src_records = data["records"]
+                record_ros = [
+                    {"fields": {k: v for k, v in r["fields"].items() if k not in excluded}}
+                    for r in src_records
+                ]
             body = SimpleNamespace(
-                name=table["name"],
-                fields=field_ros,
-                views=view_ros,
-                records=record_ros,
-                fieldKeyType=None,
-                dbTableName=None,
+                name=table["name"], fields=field_ros, views=view_ros,
+                records=record_ros, fieldKeyType=None, dbTableName=None,
             )
-            await table_service.create_table(new_base_id, body)
+            created = await table_service.create_table(new_base_id, body)
+            table_map[table["id"]] = created["id"]
+            new_by_name = {nf["name"]: nf["id"] for nf in created["fields"]}
+            for f in fields:
+                if not _is_link_or_computed(f) and f["name"] in new_by_name:
+                    field_map[f["id"]] = new_by_name[f["name"]]
+            if with_records:
+                for src_r, new_r in zip(src_records, created["records"], strict=True):
+                    record_map[src_r["id"]] = new_r["id"]
+            plans.append(
+                {
+                    "src_fields": fields,
+                    "new_table_id": created["id"],
+                    "src_records": src_records,
+                }
+            )
+        # pass 2: provision link fields through the field service so each gains its
+        # symmetric field, FK columns and junction tables in the new base. The
+        # foreign table id is remapped; a two-way link auto-creates the reverse
+        # side, so the pair is created once — the source's symmetric side is skipped
+        # and mapped to the generated reverse field, renamed to the source name.
+        handled_symmetric: set[str] = set()
+        for plan in plans:
+            for f in plan["src_fields"]:
+                if f["type"] != "link" or f.get("isLookup"):
+                    continue
+                if f["id"] in handled_symmetric:
+                    continue
+                options = f.get("options") or {}
+                new_foreign_id = table_map.get(options.get("foreignTableId"))
+                if new_foreign_id is None:
+                    continue
+                new_options: dict[str, Any] = {
+                    "relationship": options.get("relationship"),
+                    "foreignTableId": new_foreign_id,
+                    "isOneWay": bool(options.get("isOneWay")),
+                }
+                new_lookup = field_map.get(options.get("lookupFieldId"))
+                if new_lookup is not None:
+                    new_options["lookupFieldId"] = new_lookup
+                new_vo = await field_service.create_field(
+                    plan["new_table_id"],
+                    FieldCreateBody.zod_validate(
+                        {"type": "link", "name": f["name"], "options": new_options}
+                    ),
+                )
+                field_map[f["id"]] = new_vo["id"]
+                plan.setdefault("main_links", []).append((f, new_vo["id"]))
+                src_sym_id = options.get("symmetricFieldId")
+                new_sym_id = (new_vo.get("options") or {}).get("symmetricFieldId")
+                if src_sym_id and new_sym_id:
+                    handled_symmetric.add(src_sym_id)
+                    field_map[src_sym_id] = new_sym_id
+                    sym_src = src_field_by_id.get(src_sym_id)
+                    if sym_src is not None:
+                        await field_service.update_field(
+                            new_foreign_id,
+                            new_sym_id,
+                            FieldPatchBody.zod_validate({"name": sym_src["name"]}),
+                        )
+        # pass 3: rewrite link cells on the copied records, remapping each foreign
+        # record id through record_map (dropping refs with no copy). Only each
+        # link's main side is written; its symmetric cells are recomputed from it.
+        if with_records:
+            for plan in plans:
+                main_links = plan.get("main_links")
+                if not main_links:
+                    continue
+                patches: dict[str, dict[str, Any]] = {}
+                for src_field, new_field_id in main_links:
+                    options = src_field.get("options") or {}
+                    multi = link_field.is_multi_value_link(options.get("relationship"))
+                    name_key = src_field["name"]
+                    for src_record in plan["src_records"]:
+                        new_rid = record_map.get(src_record["id"])
+                        if new_rid is None:
+                            continue
+                        mapped = [
+                            record_map[i]
+                            for i in link_input_ids(src_record["fields"].get(name_key))
+                            if i in record_map
+                        ]
+                        if not mapped:
+                            continue
+                        value = [{"id": i} for i in mapped] if multi else {"id": mapped[0]}
+                        patches.setdefault(new_rid, {})[new_field_id] = value
+                if not patches:
+                    continue
+                await record_service.update_records(
+                    plan["new_table_id"],
+                    list(patches.keys()),
+                    RecordBulkPatchBody.zod_validate(
+                        {
+                            "fieldKeyType": "id",
+                            "records": [
+                                {"id": rid, "fields": flds} for rid, flds in patches.items()
+                            ],
+                        }
+                    ),
+                )
+
+        # pass 4: recreate lookup/rollup/formula fields with references remapped.
+        # Cells resolve at read time (no backfill); a dependency graph over field
+        # refs orders creation (rollup/lookup may target computed foreign fields, a
+        # formula may reference lookups/rollups/other formulas). Cycles or
+        # unresolved refs are skipped, never failing the whole duplication.
+        computed: dict[str, tuple[str, dict[str, Any], str, set[str] | None]] = {}
+        for plan in plans:
+            for f in plan["src_fields"]:
+                if f.get("isConditionalLookup") or f["type"] == "conditionalRollup":
+                    continue
+                if f.get("isLookup"):
+                    kind = "lookup"
+                elif f["type"] == "rollup":
+                    kind = "rollup"
+                elif f["type"] == "formula":
+                    kind = "formula"
+                else:
+                    continue
+                if kind == "formula":
+                    expr = (f.get("options") or {}).get("expression") or ""
+                    try:
+                        refs: set[str] | None = set(reference_field_ids(parse_formula(expr)))
+                    except FormulaError:
+                        refs = None
+                else:
+                    lo = f.get("lookupOptions") or {}
+                    refs = {r for r in (lo.get("linkFieldId"), lo.get("lookupFieldId")) if r}
+                computed[f["id"]] = (plan["new_table_id"], f, kind, refs)
+        pending = list(computed)
+        while pending:
+            ready = [
+                fid
+                for fid in pending
+                if computed[fid][3] is not None
+                and all(r in field_map for r in computed[fid][3])
+            ]
+            if not ready:
+                break
+            for fid in ready:
+                new_table_id, f, kind, _refs = computed[fid]
+                try:
+                    new_computed_id = await self._duplicate_computed_field(
+                        field_service, new_table_id, f, kind, field_map, table_map
+                    )
+                except Exception as exc:  # unresolved ref / unsupported shape: skip
+                    logger.warn(
+                        "skip computed field in base copy", field=f.get("id"), error=str(exc)
+                    )
+                    new_computed_id = None
+                if new_computed_id is not None:
+                    field_map[fid] = new_computed_id
+            ready_set = set(ready)
+            pending = [fid for fid in pending if fid not in ready_set]
 
         return {
             "id": new_base_id,
-            "name": new_name,
-            "spaceId": space_id,
-            "icon": source.get("icon"),
+            "name": result_name,
+            "spaceId": result_space_id,
+            "icon": result_icon,
         }
+
+    async def _duplicate_computed_field(
+        self,
+        field_service: Any,
+        table_id: str,
+        f: dict[str, Any],
+        kind: str,
+        field_map: dict[str, str],
+        table_map: dict[str, str],
+    ) -> str | None:
+        """Create one copied lookup/rollup/formula field with refs remapped; return
+        its new id, or None when a reference cannot be remapped."""
+        from ..field.schemas import FieldCreateBody
+
+        if kind == "formula":
+            expr = _remap_formula_expression(
+                (f.get("options") or {}).get("expression") or "", field_map
+            )
+            body: dict[str, Any] = {
+                "type": "formula",
+                "name": f["name"],
+                "options": {**(f.get("options") or {}), "expression": expr},
+            }
+        else:
+            lo = f.get("lookupOptions") or {}
+            new_link = field_map.get(lo.get("linkFieldId"))
+            new_foreign = table_map.get(lo.get("foreignTableId"))
+            new_lookup = field_map.get(lo.get("lookupFieldId"))
+            if not (new_link and new_foreign and new_lookup):
+                return None
+            body = {
+                "name": f["name"],
+                "options": f.get("options") or {},
+                "lookupOptions": {
+                    "linkFieldId": new_link,
+                    "foreignTableId": new_foreign,
+                    "lookupFieldId": new_lookup,
+                },
+            }
+            if kind == "lookup":
+                body["type"] = f["type"]
+                body["isLookup"] = True
+            else:
+                body["type"] = "rollup"
+        vo = await field_service.create_field(table_id, FieldCreateBody.zod_validate(body))
+        return vo["id"]
 
     async def update_order(self, base_id: str, anchor_id: str, position: str) -> None:
         base = await repository.get_base_row(base_id)

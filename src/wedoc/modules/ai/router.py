@@ -37,7 +37,9 @@ async def get_ai_disable_ai_actions(baseId: str) -> dict[str, Any]:
     return await AiService().get_ai_disable_ai_actions(baseId)
 
 
-chat_router = APIRouter(prefix="/api/chart", dependencies=[Depends(auth_guard)])
+chat_router = APIRouter(
+    prefix="/api/chart", dependencies=[Depends(auth_guard), Depends(permission_guard)]
+)
 
 
 @chat_router.post("/completions", status_code=201)

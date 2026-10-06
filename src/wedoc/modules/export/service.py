@@ -8,6 +8,7 @@ numeric/date formatting reuses the record VO values.
 
 import json
 from typing import Any
+from urllib.parse import quote
 
 from ...core.errors import ApiError, HttpErrorCode
 from .. import table as _table_pkg  # noqa: F401  (ensure package import side effects)
@@ -111,14 +112,20 @@ class ExportService:
         view_row = None
         if view_id and not ignore_view_query:
             view_row = await get_view_row(table_id, view_id)
-            if view_row is not None and view_row["type"] != "grid":
+            # ref: `viewRaw?.type !== Grid` throws — a missing/foreign viewId yields
+            # an undefined type and 400s too (no silent full-table export).
+            if view_row is None or view_row["type"] != "grid":
+                view_type = view_row["type"] if view_row else "undefined"
+                # JS `{ viewType: undefined }` serializes with the key omitted, so
+                # a missing view yields an empty context (not viewType: null).
+                context = {"viewType": view_row["type"]} if view_row else {}
                 raise ApiError(
-                    f"{view_row['type']} is not support to export",
+                    f"{view_type} is not support to export",
                     HttpErrorCode.VALIDATION_ERROR,
                     {
                         "localization": {
                             "i18nKey": "httpErrors.export.notSupportViewType",
-                            "context": {"viewType": view_row["type"]},
+                            "context": context,
                         }
                     },
                 )
@@ -161,7 +168,13 @@ class ExportService:
             count += len(records)
 
         _ = table
-        return "".join(chunks)
+        table_name = table.get("name") if isinstance(table, dict) else None
+        if table_name:
+            suffix = f"_{view_row['name']}" if view_row else ""
+            filename = quote(f"{table_name}{suffix}")
+        else:
+            filename = "export"
+        return "".join(chunks), filename
 
 
 def _json(raw: Any) -> dict[str, Any]:

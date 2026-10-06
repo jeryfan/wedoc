@@ -1,12 +1,16 @@
 """Attachment domain service — ports attachments.service.ts + plugins/local.ts.
 
 Local provider only: signature -> PUT/POST upload -> notify -> read, with the
-AES read-token codec and If-Modified-Since / 304 conditional caching. sharp
-thumbnail crop queue is replaced by synchronous Pillow dimension probing; the
-pixel-exact thumbnail byte-cropping is deferred (documented in the ledger).
+AES read-token codec and If-Modified-Since / 304 conditional caching. The sharp
+thumbnail crop queue is replaced by synchronous Pillow processing: notify probes
+image dimensions and, for images taller than the sm/lg thumbnail heights,
+generates and stores the {sm,lg} thumbnails whose paths back a cell's
+smThumbnailUrl / lgThumbnailUrl on read.
 """
 
 import hashlib
+import io
+import json
 import math
 import os
 import time
@@ -23,6 +27,16 @@ from ...core.storage import READ_PATH, get_storage, path_join, storage_token_enc
 from . import repository, schemas
 
 _IMAGE_MIME_PREFIX = "image/"
+
+# thumbnail geometry ported from features/attachments/constant.ts; images taller
+# than a bound get a height-clamped thumbnail at {path}_sm / {path}_lg.
+_ATTACHMENT_SM_THUMBNAIL_HEIGHT = 56
+_ATTACHMENT_LG_THUMBNAIL_HEIGHT = 525
+_ATTACHMENT_THUMBNAIL_DEFAULT_MIMETYPE = "image/png"
+
+
+def _crop_image_path(path: str, size: str) -> str:
+    return f"{path}_{size}"
 
 
 def _encode_uri_component(value: str) -> str:
@@ -50,6 +64,12 @@ def _invalid_path() -> ApiError:
 
 def _is_image(mimetype: str) -> bool:
     return bool(mimetype) and mimetype.startswith(_IMAGE_MIME_PREFIX)
+
+
+def _resolve_thumbnail_mimetype(mimetype: str) -> str:
+    # ports resolveThumbnailMimetype: images keep their type, everything else
+    # (pdf pages...) renders to png.
+    return mimetype if _is_image(mimetype) else _ATTACHMENT_THUMBNAIL_DEFAULT_MIMETYPE
 
 
 def _extension_preview(content_type: str) -> str:
@@ -248,8 +268,11 @@ class AttachmentService:
 
         width: int | None = None
         height: int | None = None
+        thumbnail_path: str | None = None
         if _is_image(mimetype or ""):
             width, height = self._image_dimensions(bucket, path)
+            if height is not None:
+                thumbnail_path = self._generate_thumbnails(bucket, path, height)
 
         url = self._read_url(bucket, path, {"Content-Type": mimetype}, -1)
 
@@ -262,6 +285,7 @@ class AttachmentService:
             width=width,
             height=height,
             created_by=user_id,
+            thumbnail_path=thumbnail_path,
         )
 
         resp_headers = {"Content-Type": mimetype}
@@ -294,6 +318,93 @@ class AttachmentService:
                 return img.width, img.height
         except Exception:
             return None, None
+
+    def _generate_thumbnails(self, bucket: str, path: str, height: int) -> str | None:
+        """Crop {sm,lg} thumbnails for an image and return the persisted path map.
+
+        Ports cropTableImage: a size is produced only when the source is taller
+        than that bound, so a short image yields ``{}`` (mirroring the reference, which
+        still records an empty map). Returns None when Pillow cannot open it, so
+        the read path falls back to the presigned original for images.
+        """
+        try:
+            from PIL import Image
+        except Exception:
+            return None
+        thumb: dict[str, str] = {}
+        source = self._storage.root / bucket / path
+        try:
+            for size, limit in (
+                ("sm", _ATTACHMENT_SM_THUMBNAIL_HEIGHT),
+                ("lg", _ATTACHMENT_LG_THUMBNAIL_HEIGHT),
+            ):
+                if height <= limit:
+                    continue
+                with Image.open(source) as img:
+                    ratio = limit / img.height
+                    new_width = max(1, round(img.width * ratio))
+                    resized = img.resize((new_width, limit))
+                    buffer = io.BytesIO()
+                    resized.save(buffer, format="PNG")
+                target_path = _crop_image_path(path, size)
+                self._storage.upload_file(bucket, target_path, buffer.getvalue())
+                thumb[size] = target_path
+        except Exception:
+            return None
+        return json.dumps(thumb, separators=(",", ":"))
+
+    # -- record read enrichment ------------------------------------------------
+    def _table_bucket(self) -> str:
+        return schemas.upload_bucket(
+            int(schemas.UploadType.TABLE),
+            self._settings.backend_storage_public_bucket,
+            self._settings.backend_storage_private_bucket,
+        )
+
+    def presign_cell_item(
+        self, item: dict[str, Any], thumbnail: dict[str, str] | None
+    ) -> dict[str, Any]:
+        """Add ephemeral presignedUrl/smThumbnailUrl/lgThumbnailUrl to a cell item.
+
+        Ports getAttachmentPresignedCellValue: images always expose both thumbnail
+        urls (falling back to the presigned original when a size was not cropped);
+        non-images expose a thumbnail url only when one was actually generated.
+        The signed urls are never persisted — they decorate the read response only.
+        """
+        path = item.get("path")
+        if not isinstance(path, str):
+            return item
+        mimetype = item.get("mimetype") if isinstance(item.get("mimetype"), str) else ""
+        name = item.get("name")
+        filename = name if isinstance(name, str) else (item.get("token") or "")
+        bucket = self._table_bucket()
+        disposition = f"attachment; filename*=UTF-8''{_encode_uri_component(filename)}"
+        resp_headers = {
+            "Content-Type": mimetype,
+            "Content-Disposition": disposition,
+        }
+        presigned = self._preview_url(bucket, path, resp_headers)
+        result: dict[str, Any] = {**item, "presignedUrl": presigned}
+        is_img = _is_image(mimetype)
+        thumb_mimetype = _resolve_thumbnail_mimetype(mimetype)
+        sm_url: str | None = None
+        lg_url: str | None = None
+        if thumbnail:
+            sm_path = thumbnail.get("sm")
+            lg_path = thumbnail.get("lg")
+            if sm_path:
+                sm_url = self._preview_url(bucket, sm_path, {"Content-Type": thumb_mimetype})
+            if lg_path:
+                lg_url = self._preview_url(bucket, lg_path, {"Content-Type": thumb_mimetype})
+        if is_img:
+            result["smThumbnailUrl"] = sm_url or presigned
+            result["lgThumbnailUrl"] = lg_url or presigned
+        else:
+            if sm_url is not None:
+                result["smThumbnailUrl"] = sm_url
+            if lg_url is not None:
+                result["lgThumbnailUrl"] = lg_url
+        return result
 
     # -- read ------------------------------------------------------------------
     def _resolve_read(self, path: str) -> Path:

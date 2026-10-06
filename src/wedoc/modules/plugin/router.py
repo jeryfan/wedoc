@@ -6,7 +6,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request, Response
 
 from ...core.errors import ApiError, HttpErrorCode
-from ...core.security.auth import allow_anonymous, auth_guard, permissions, resource_meta
+from ...core.query import query_array
+from ...core.security.auth import (
+    allow_anonymous,
+    auth_guard,
+    disabled_permission,
+    permissions,
+    resource_meta,
+)
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
 from .schemas import CreatePluginRo, PluginGetTokenRo, PluginRefreshTokenRo, UpdatePluginRo
@@ -47,7 +54,9 @@ async def dashboard_query(
     )
 
 
-router = APIRouter(prefix="/api/plugin", dependencies=[Depends(auth_guard)])
+router = APIRouter(
+    prefix="/api/plugin", dependencies=[Depends(auth_guard), Depends(permission_guard)]
+)
 
 
 @router.post("", status_code=201)
@@ -64,7 +73,7 @@ async def get_plugins() -> list[dict[str, Any]]:
 @router.get("/center/list", status_code=200)
 async def get_plugin_center_list(request: Request) -> list[dict[str, Any]]:
     params = request.query_params
-    ids = params.getlist("ids") or None
+    ids = query_array(params, "ids")
     positions = None
     if "positions" in params:
         try:
@@ -80,6 +89,8 @@ async def regenerate_secret(plugin_id: str) -> dict[str, Any]:
 
 
 @router.post("/{plugin_id}/authCode", status_code=201)
+@permissions("base|read")
+@resource_meta("baseId", "body")
 async def auth_code(plugin_id: str, request: Request) -> str:
     body = await read_json_body(request)
     base_id = body.get("baseId", "") if isinstance(body, dict) else ""
@@ -118,8 +129,11 @@ async def delete_plugin(plugin_id: str) -> Response:
 # token endpoints: @Public upstream — auth strategies still run passively to
 # populate the caller (developer previewing their own unpublished plugin), so
 # they are modelled as allow-anonymous rather than isPublic (which skips auth).
+# disabled_permission mirrors the upstream PermissionGuard @Public short-circuit
+# so the router-level permission_guard never gates these otherwise-public routes.
 @router.post("/{plugin_id}/token", status_code=201)
 @allow_anonymous()
+@disabled_permission()
 async def access_token(plugin_id: str, request: Request) -> dict[str, Any]:
     ro = PluginGetTokenRo.zod_validate(await read_json_body(request))
     return await PluginAuthService().token(plugin_id, ro)
@@ -127,6 +141,7 @@ async def access_token(plugin_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/{plugin_id}/refreshToken", status_code=201)
 @allow_anonymous()
+@disabled_permission()
 async def refresh_token(plugin_id: str, request: Request) -> dict[str, Any]:
     ro = PluginRefreshTokenRo.zod_validate(await read_json_body(request))
     return await PluginAuthService().refresh_token(plugin_id, ro)

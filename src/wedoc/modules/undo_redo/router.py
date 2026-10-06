@@ -13,7 +13,7 @@ from ...compat import undo_redo_engine_header
 from ...core import cls
 from ...core.security.auth import auth_guard, permissions
 from ...core.security.permissions import permission_guard
-from .service import ENGINE, UndoRedoService
+from .service import UndoRedoService, engine_for
 
 router = APIRouter(
     prefix="/api/table/{tableId}/undo-redo",
@@ -29,7 +29,7 @@ def _window_id(request: Request) -> str | None:
 @permissions("table|read")
 async def undo(tableId: str, request: Request, response: Response) -> dict[str, Any]:
     result = await UndoRedoService().undo(tableId, _window_id(request))
-    response.headers[undo_redo_engine_header()] = ENGINE
+    response.headers[undo_redo_engine_header()] = engine_for(result)
     return result
 
 
@@ -37,7 +37,7 @@ async def undo(tableId: str, request: Request, response: Response) -> dict[str, 
 @permissions("table|read")
 async def redo(tableId: str, request: Request, response: Response) -> dict[str, Any]:
     result = await UndoRedoService().redo(tableId, _window_id(request))
-    response.headers[undo_redo_engine_header()] = ENGINE
+    response.headers[undo_redo_engine_header()] = engine_for(result)
     return result
 
 
@@ -50,6 +50,8 @@ def _sse(events: AsyncIterator[dict[str, Any]]) -> StreamingResponse:
         stream(),
         media_type="text/event-stream",
         headers={
+            # explicit content-type suppresses Starlette's "; charset=utf-8"
+            "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",

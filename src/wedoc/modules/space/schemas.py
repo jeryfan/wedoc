@@ -3,7 +3,7 @@
 import re as _re
 from typing import Any
 
-from pydantic import StrictBool, field_validator, model_validator
+from pydantic import Field, StrictBool, field_validator, model_validator
 
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel
@@ -12,15 +12,19 @@ _INTERNAL_SCHEMA_RE = _re.compile(r"^[a-z_]\w*$", _re.IGNORECASE)
 
 SPACE_NAME_MAX_LENGTH = 100
 
-# zod enum over the TS PrincipalType enum object (value|Key interleaved, as the
-# bundled backend's reverse-mapped enum accepts keys too).
-PRINCIPAL_TYPE_OPTIONS = ["user", "User", "department", "Department"]
+# PrincipalType is a string enum (`user` / `department`); zod validates against
+# its values only, so the keys are not accepted.
+PRINCIPAL_TYPE_OPTIONS = ["user", "department"]
 PRINCIPAL_TYPES = {opt.lower() for opt in PRINCIPAL_TYPE_OPTIONS}
 
 ROLE_OPTIONS = ["owner", "creator", "editor", "commenter", "viewer"]
 
-# ResourceType members that getTableMapping() can search.
-SEARCHABLE_RESOURCE_OPTIONS = ["base", "Base", "table", "Table", "dashboard", "Dashboard"]
+# ResourceType members accepted by the search `type` param (full string enum,
+# lowercase values only).
+SEARCHABLE_RESOURCE_OPTIONS = [
+    "space", "base", "table", "view", "field", "record",
+    "workflow", "app", "dashboard", "folder", "routine",
+]
 
 PrincipalTypeStr = ZodEnumStr(PRINCIPAL_TYPE_OPTIONS)
 RoleStr = ZodEnumStr(ROLE_OPTIONS)
@@ -157,7 +161,7 @@ class InvitationLinkBody(ZodModel):
 
 
 class EmailInvitationBody(ZodModel):
-    emails: list[ZodEmailStr]
+    emails: list[ZodEmailStr] = Field(min_length=1)
     role: RoleStr
 
 

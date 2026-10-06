@@ -145,7 +145,11 @@ class BaseShareService:
     async def get_base_share_info(self, share_id: str) -> dict[str, Any]:
         share = await repository.find_by_share_id(share_id)
         if not share or not share["enabled"]:
-            raise _share_not_found()
+            raise ApiError(
+                "Project share not found",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": _NOT_FOUND_KEY}},
+            )
         return {
             "shareId": share["shareId"],
             "baseId": share["baseId"],
@@ -232,7 +236,14 @@ class BaseShareService:
             if node_id is not None:
                 return None
             table_id = await repository.first_table_id(base_id)
-            return f"/base/{base_id}/table/{table_id}" if table_id else None
+            if not table_id:
+                return None
+            view_id = await repository.first_view_id(table_id)
+            return (
+                f"/base/{base_id}/table/{table_id}/{view_id}"
+                if view_id
+                else f"/base/{base_id}/table/{table_id}"
+            )
 
         target: dict[str, Any] | None = None
         if node_id is None:
@@ -252,7 +263,12 @@ class BaseShareService:
         resource_type = target["resourceType"].lower()
         resource_id = target["resourceId"]
         if resource_type == "table":
-            return f"/base/{base_id}/table/{resource_id}"
+            view_id = await repository.first_view_id(resource_id)
+            return (
+                f"/base/{base_id}/table/{resource_id}/{view_id}"
+                if view_id
+                else f"/base/{base_id}/table/{resource_id}"
+            )
         if resource_type == "dashboard":
             return f"/base/{base_id}/dashboard/{resource_id}"
         if resource_type == "workflow":

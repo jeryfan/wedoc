@@ -107,13 +107,15 @@ def rename_data_table_sql(schema_name: str, old_name: str, new_name: str) -> str
     )
 
 
-# field type -> physical column type; extended with the field module later.
+# field type -> physical column type for a single-value cell; multi-value cells
+# (isMultipleCellValue) are always jsonb — see column_type_for. A single user
+# cell is a text column holding one JSON object; a multi user cell is jsonb.
 FIELD_DB_TYPES: dict[str, str] = {
     "singleLineText": "text",
     "longText": "text",
     "number": "double precision",
     "singleSelect": "text",
-    "multipleSelect": "text[]",
+    "multipleSelect": "jsonb",
     "checkbox": "boolean",
     "rating": "double precision",
     "date": "timestamptz",
@@ -122,11 +124,20 @@ FIELD_DB_TYPES: dict[str, str] = {
     "lastModifiedTime": "timestamptz",
     "createdBy": "text",
     "lastModifiedBy": "text",
-    "user": "jsonb",
+    "user": "text",
     "attachment": "jsonb",
     "button": "text",
     "link": "jsonb",
 }
+
+
+def column_type_for(field_type: str, is_multiple_cell_value: bool = False) -> str:
+    """Physical column type for a field. Multi-value cells are stored as jsonb
+    (mirrors the reference get-db-field-type: isMultipleCellValue -> JSON); a
+    single-value cell uses the per-type default in FIELD_DB_TYPES."""
+    if is_multiple_cell_value:
+        return "jsonb"
+    return FIELD_DB_TYPES[field_type]
 
 # db field type (upstream DbFieldType) -> physical column type, used for the
 # base column of computed fields (lookup/rollup) whose db type is derived.
@@ -142,9 +153,13 @@ DB_FIELD_TYPE_TO_COLUMN = {
 
 
 def add_field_column_sql(
-    schema_name: str, table_name: str, db_field_name: str, field_type: str
+    schema_name: str,
+    table_name: str,
+    db_field_name: str,
+    field_type: str,
+    is_multiple_cell_value: bool = False,
 ) -> str:
-    column_type = FIELD_DB_TYPES[field_type]
+    column_type = column_type_for(field_type, is_multiple_cell_value)
     return (
         f"ALTER TABLE {_qualified(schema_name, table_name)} "
         f"ADD COLUMN {_quoted_identifier(db_field_name)} {column_type} NULL"
@@ -162,6 +177,30 @@ def add_column_by_db_type_sql(
     )
 
 
+def unique_index_name(field_id: str) -> str:
+    """Deterministic, field-scoped index name. Postgres reports this name as the
+    violated constraint, so the field id round-trips out of a unique violation."""
+    return f"uq_{field_id}"
+
+
+def add_unique_index_sql(
+    schema_name: str, table_name: str, db_field_name: str, field_id: str
+) -> str:
+    # A plain unique index already treats NULLs as distinct, so multiple empty
+    # cells are allowed while duplicate non-null values are rejected.
+    return (
+        f"CREATE UNIQUE INDEX {_quoted_identifier(unique_index_name(field_id))} "
+        f"ON {_qualified(schema_name, table_name)} ({_quoted_identifier(db_field_name)})"
+    )
+
+
+def drop_unique_index_sql(schema_name: str, field_id: str) -> str:
+    return (
+        f"DROP INDEX IF EXISTS "
+        f"{_qualified(schema_name, unique_index_name(field_id))}"
+    )
+
+
 from .link import (  # noqa: E402
     foreign_key_name,
     junction_table_name,
@@ -173,15 +212,19 @@ from .link import (  # noqa: E402
 __all__ = [
     "add_column_by_db_type_sql",
     "add_field_column_sql",
+    "add_unique_index_sql",
+    "column_type_for",
     "convert_name_to_valid_character",
     "create_data_table_sql",
     "create_schema_sql",
     "drop_data_table_sql",
     "drop_schema_sql",
+    "drop_unique_index_sql",
     "foreign_key_name",
     "junction_table_name",
     "link_relation_ddl",
     "link_relation_teardown_ddl",
     "parse_db_table_name",
     "rename_data_table_sql",
+    "unique_index_name",
 ]

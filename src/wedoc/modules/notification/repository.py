@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from ...db import engine as db_engine
 from ...db.models_meta import Notification, User
@@ -165,11 +165,22 @@ async def insert_notification(row: dict[str, Any]) -> None:
         await session.commit()
 
 
-async def get_user_ids_by_emails(emails: list[str]) -> list[str]:
-    if not emails:
+async def get_users_by_ids_or_emails(
+    user_ids: list[str], emails: list[str]
+) -> list[dict[str, str]]:
+    conditions = []
+    if user_ids:
+        conditions.append(User.id.in_(user_ids))
+    if emails:
+        conditions.append(User.email.in_([e.lower() for e in emails]))
+    if not conditions:
         return []
     async with db_engine.session() as session:
         rows = (
-            await session.execute(select(User.id).where(User.email.in_(emails)))
+            await session.execute(
+                select(User.id, User.email).where(
+                    or_(*conditions), User.deleted_time.is_(None)
+                )
+            )
         ).all()
-    return [r[0] for r in rows]
+    return [{"id": r[0], "email": r[1]} for r in rows]

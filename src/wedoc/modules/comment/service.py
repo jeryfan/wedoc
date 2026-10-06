@@ -215,7 +215,7 @@ class CommentService:
         self,
         table_id: str,
         record_id: str,
-        take: int,
+        take: int | float,
         cursor: str | None,
         direction: str,
         include_cursor: bool,
@@ -453,7 +453,9 @@ class CommentService:
         await repository.create_subscription(table_id, record_id, cls.get("user.id"))
 
     async def unsubscribe_comment(self, table_id: str, record_id: str) -> None:
-        await repository.delete_subscription(table_id, record_id)
+        count = await repository.delete_subscription(table_id, record_id)
+        if not count:
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
 
     # -- attachment ------------------------------------------------------------
     async def get_attachment_presigned_url(
@@ -514,10 +516,13 @@ class CommentService:
         url_path = (
             f"/base/{base_id}/table/{table_id}?recordId={record_id}&commentId={comment_id}"
         )
-        message = f"{from_user_name} commented on {record_name} in {table_name}".strip()
+        message = (
+            f"{from_user_name} made a comment on {record_name} "
+            f"in {table_name} in {base_name}"
+        )
         message_i18n = json.dumps(
             {
-                "i18nKey": "common.email.templates.notify.recordComment.message",
+                "i18nKey": "email.templates.notify.recordComment.message",
                 "context": {
                     "fromUserName": from_user_name,
                     "recordName": record_name,

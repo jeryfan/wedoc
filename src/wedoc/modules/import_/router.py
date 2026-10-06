@@ -5,16 +5,32 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 
-from ...core.errors import ApiError
+from ...core.errors import ApiError, HttpErrorCode
 from ...core.security.auth import auth_guard, permissions, token_access
 from ...core.security.permissions import permission_guard
 from ...core.validation import read_json_body
+from ..table import repository as table_repository
 from .schemas import AnalyzeRo, ImportOptionRo, InplaceImportOptionRo
 from .service import ImportService
 
+
+async def _require_import_table(request: Request) -> None:
+    # tableId-only routes (import status) resolve the table themselves: a missing
+    # table reports 404 "Invalid tableId" before the shared 403 guard. The inplace
+    # routes carry baseId and keep their own base-scoped not-found message.
+    pp = request.path_params
+    table_id = pp.get("tableId")
+    if table_id and "baseId" not in pp and not await table_repository.table_exists_by_id(table_id):
+        raise ApiError(
+            f"Invalid tableId: {table_id}",
+            HttpErrorCode.NOT_FOUND,
+            {"localization": {"i18nKey": "httpErrors.table.notFound"}},
+        )
+
+
 router = APIRouter(
     prefix="/api/import",
-    dependencies=[Depends(auth_guard), Depends(permission_guard)],
+    dependencies=[Depends(auth_guard), Depends(_require_import_table), Depends(permission_guard)],
 )
 
 _SSE_HEADERS = {
@@ -67,9 +83,10 @@ def _error_event(message: str) -> dict[str, Any]:
 @token_access()
 async def analyze(request: Request) -> dict[str, Any]:
     params = request.query_params
-    ro = AnalyzeRo.zod_validate(
-        {"attachmentUrl": params.get("attachmentUrl"), "fileType": params.get("fileType")}
-    )
+    # absent query params must read as undefined (not null) so zod reports
+    # "received undefined" / the fileType enum error, matching the reference.
+    raw = {k: params[k] for k in ("attachmentUrl", "fileType") if k in params}
+    ro = AnalyzeRo.zod_validate(raw)
     return await ImportService().analyze(ro)
 
 
@@ -110,7 +127,15 @@ async def create_table_from_import_stream(baseId: str, request: Request) -> Resp
     return _sse(events)
 
 
-@router.patch("/{baseId}/{tableId}", status_code=200)
+async def _table_base_scope_guard(baseId: str, tableId: str) -> None:
+    await ImportService().assert_table_in_base(baseId, tableId)
+
+
+@router.patch(
+    "/{baseId}/{tableId}",
+    status_code=200,
+    dependencies=[Depends(_table_base_scope_guard)],
+)
 @permissions("table|import")
 async def inplace_import_table(baseId: str, tableId: str, request: Request) -> Response:
     ro = InplaceImportOptionRo.zod_validate(await read_json_body(request))
@@ -118,7 +143,11 @@ async def inplace_import_table(baseId: str, tableId: str, request: Request) -> R
     return Response(status_code=200)
 
 
-@router.patch("/{baseId}/{tableId}/stream", status_code=200)
+@router.patch(
+    "/{baseId}/{tableId}/stream",
+    status_code=200,
+    dependencies=[Depends(_table_base_scope_guard)],
+)
 @permissions("table|import")
 async def inplace_import_table_stream(
     baseId: str, tableId: str, request: Request

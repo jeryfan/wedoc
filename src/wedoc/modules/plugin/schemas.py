@@ -1,10 +1,11 @@
 """Plugin request schemas — ports packages/openapi/src/plugin."""
 
+from typing import Annotated
 from urllib.parse import urlparse
 
-from pydantic import field_validator
+from pydantic import StrictBool, field_validator
 
-from ...core.validation import ZodEnumStr, ZodModel
+from ...core.validation import ZodEnumStr, ZodExpected, ZodModel
 
 PLUGIN_POSITIONS = ["dashboard", "view", "contextMenu", "panel"]
 PositionStr = ZodEnumStr(PLUGIN_POSITIONS)
@@ -77,7 +78,7 @@ class CreatePluginRo(ZodModel):
     helpUrl: str | None = None
     positions: list[PositionStr]
     i18n: dict | None = None
-    autoCreateMember: bool | None = None
+    autoCreateMember: Annotated[StrictBool | None, ZodExpected("boolean")] = None
 
     @field_validator("name")
     @classmethod
