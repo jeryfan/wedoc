@@ -21,7 +21,6 @@ the schemas with the ``zod_*`` helpers below, which raise the zod message
 verbatim.
 """
 
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,6 +28,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, ValidationError
 
+from . import json_v8, qs
 from .errors import ApiError, HttpErrorCode
 
 # zod 4.1.8 regexes.js `email` (the default z.string().email() pattern)
@@ -160,21 +160,72 @@ def zod_int(value: Any) -> int:
     return int(value)
 
 
+MAX_BODY_BYTES = 50 * 1024 * 1024
+"""express.json/urlencoded limit '50mb'; exceeding it is a 500 on the reference."""
+
+
+def _content_type_parts(header: str | None) -> tuple[str | None, str | None]:
+    """Media type and charset, lowercased; (None, None) when the header is unusable."""
+    if not header:
+        return None, None
+    parts = header.split(";")
+    media = parts[0].strip().lower()
+    if "/" not in media:
+        return None, None
+    charset: str | None = None
+    for parameter in parts[1:]:
+        if "=" not in parameter:
+            continue
+        name, value = parameter.split("=", 1)
+        if name.strip().lower() == "charset":
+            charset = value.strip().strip('"')
+    return media, charset
+
+
 async def read_json_body(request: Any) -> Any:
-    """Express body-parser json() equivalent: {} for absent/non-JSON bodies."""
-    content_type = request.headers.get("content-type") or ""
-    if "application/json" not in content_type:
+    """body-parser equivalent for the two parsers the reference registers.
+
+    * ``application/json``: V8 ``JSON.parse`` with body-parser's strict check.
+    * ``application/x-www-form-urlencoded``: qs with body-parser's options.
+    * anything else (or no body): ``{}``, exactly like a skipped parser.
+    """
+    media, charset = _content_type_parts(request.headers.get("content-type"))
+    if media not in ("application/json", "application/x-www-form-urlencoded"):
         return {}
+    if charset is not None and charset != "" and charset.lower() != "utf-8":
+        # body-parser raises 415 charset.unsupported / iconv failure; the global
+        # exception filter turns both into a plain 500.
+        raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
+    if charset == "":
+        return {}
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
     raw = await request.body()
-    if not raw or not raw.strip():
+    if not raw:
         return {}
+    if len(raw) > MAX_BODY_BYTES:
+        raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
+    text = raw.decode("utf-8", errors="replace")
+    if text.startswith("\ufeff"):
+        # iconv-lite strips a UTF-8 BOM before JSON.parse/qs see the body; a
+        # BOM-only body is therefore the empty body body-parser special-cases.
+        text = text[1:]
+    if not text:
+        return {}
+    if media == "application/x-www-form-urlencoded":
+        try:
+            count = qs.count_parameters(text)
+            return qs.parse(text, array_limit=max(qs.DEFAULT_ARRAY_LIMIT, count))
+        except (qs.QsParameterLimitError, qs.QsDepthError) as exc:
+            raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR) from exc
+    strict = json_v8.strict_message(text)
+    if strict is not None:
+        raise ApiError(strict, HttpErrorCode.VALIDATION_ERROR)
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ApiError(
-            f"Unexpected token in JSON at position {exc.pos}",
-            HttpErrorCode.VALIDATION_ERROR,
-        ) from exc
+        return json_v8.parse(text)
+    except json_v8.JsonSyntaxError as exc:
+        raise ApiError(str(exc), HttpErrorCode.VALIDATION_ERROR) from exc
 
 
 class _ZodTypeError(ValueError):
@@ -413,9 +464,35 @@ def format_zod_errors(model: type[BaseModel] | None, errors: list[dict[str, Any]
 MAX_ERROR_LENGTH = 1000  # ZodValidationPipe truncates past this
 
 
+def _reject_js_constructor(model: type[BaseModel], data: Any, loc: tuple[Any, ...]) -> None:
+    """zod plain-object check: a record whose own ``constructor`` is not Object fails.
+
+    zod decides a value is a plain object with ``proto === null || proto.constructor === Object``;
+    qs/JSON bodies can carry an own ``constructor`` key, which then reports
+    ``expected record, received object``. Emulated here for dict-typed fields.
+    """
+    if not isinstance(data, dict):
+        return
+    for name, field_info in model.model_fields.items():
+        if name not in data or not isinstance(data[name], dict):
+            continue
+        node = _unwrap_union(field_info.annotation)
+        path = (*loc, name)
+        expected = _field_expected(model, path) or "record"
+        if getattr(node, "__origin__", None) is dict and "constructor" in data[name]:
+            raise ApiError(
+                "Validation error: Invalid input: "
+                f'expected {expected}, received object at "{_join_path(path)}"',
+                HttpErrorCode.VALIDATION_ERROR,
+            )
+        if isinstance(node, type) and issubclass(node, BaseModel):
+            _reject_js_constructor(node, data[name], path)
+
+
 def zod_validate(model: type[BaseModel], data: Any) -> Any:
     # zod `.optional()` accepts absence but rejects explicit null; Pydantic's
     # `X | None` accepts both, so reject nulls up front with zod's wording.
+    _reject_js_constructor(model, data, ())
     if isinstance(data, dict):
         for name, field_info in model.model_fields.items():
             nullable = any(isinstance(m, ZodNullable) for m in field_info.metadata)
