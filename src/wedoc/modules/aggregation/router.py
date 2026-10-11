@@ -22,16 +22,32 @@ router = APIRouter(
 )
 
 
-def _json_param(raw: str | None, name: str) -> Any:
+def _json_param(raw: str | None, name: str, noun: str = "object") -> Any:
     if raw is None:
         return None
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        # zod preprocesses these params with JSON.parse and lets the schema
+        # reject the leftover string, so the noun depends on the field.
         raise ApiError(
-            f'Validation error: Invalid input: expected object at "{name}"',
+            f'Validation error: Invalid input: expected {noun}, received string at "{name}"',
             HttpErrorCode.VALIDATION_ERROR,
         ) from None
+
+
+def _js_number(raw: str) -> float:
+    """JavaScript ``Number(str)``: ``""`` is 0 and unparseable text is NaN."""
+    text = raw.strip()
+    if text == "":
+        return 0.0
+    try:
+        sign = -1 if text.startswith("-") else 1
+        if text.lstrip("+-").lower().startswith("0x"):
+            return float(sign * int(text.lstrip("+-"), 16))
+        return float(text)
+    except ValueError:
+        return float("nan")
 
 
 def _sort_items(raw: Any, name: str) -> list[dict[str, Any]] | None:
@@ -145,7 +161,7 @@ def _ignore_view_query(params: Any) -> bool:
 
 
 def _tql_or_filter(params: Any) -> tuple[dict[str, Any] | None, str | None]:
-    filter_param = _json_param(params.get("filter"), "filter")
+    filter_param = _json_param(params.get("filter"), "filter", "object")
     tql = params.get("filterByTql")
     return filter_param, tql
 
@@ -207,7 +223,7 @@ async def get_aggregation(tableId: str, request: Request) -> dict[str, Any]:
         tql=tql,
         search=_search_param(params),
         view_id=params.get("viewId"),
-        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy"), "groupBy"),
+        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy", "array"), "groupBy"),
         ignore_view_query=_ignore_view_query(params),
     )
 
@@ -246,8 +262,8 @@ async def get_record_index(tableId: str, request: Request):
     result = await AggregationService().get_record_index(
         tableId,
         record_id=record_id,
-        filter_param=_json_param(params.get("filter"), "filter"),
-        order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy"), "orderBy"),
+        filter_param=_json_param(params.get("filter"), "filter", "object"),
+        order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy", "array"), "orderBy"),
         view_id=params.get("viewId"),
         ignore_view_query=_ignore_view_query(params),
     )
@@ -263,7 +279,7 @@ async def get_search_count(tableId: str, request: Request) -> dict[str, Any]:
     params = request.query_params
     return await AggregationService().get_search_count(
         tableId,
-        filter_param=_json_param(params.get("filter"), "filter"),
+        filter_param=_json_param(params.get("filter"), "filter", "object"),
         search=_search_param(params),
         view_id=params.get("viewId"),
         ignore_view_query=_ignore_view_query(params),
@@ -276,14 +292,33 @@ async def get_search_count(tableId: str, request: Request) -> dict[str, Any]:
 async def get_search_index(tableId: str, request: Request):
     params = request.query_params
     skip = _int_param(params, "skip") or 0
+    issues: list[str] = []
+    try:
+        search = _search_param(params)
+    except ApiError as exc:
+        issues.append(exc.message.removeprefix("Validation error: "))
+        search = None
+    raw_take = params.get("take")
+    # searchIndexByQueryRoSchema.take is `z.coerce.number()` (required): an
+    # absent or unparseable value reports NaN before the query runs.
+    number = _js_number(raw_take) if raw_take is not None else float("nan")
+    take: float | None = None
+    if number != number:  # NaN
+        issues.append('Invalid input: expected number, received NaN at "take"')
+    else:
+        take = number
+    if issues:
+        raise ApiError(
+            "Validation error: " + "; ".join(issues), HttpErrorCode.VALIDATION_ERROR
+        )
     result = await AggregationService().get_search_index(
         tableId,
-        filter_param=_json_param(params.get("filter"), "filter"),
-        search=_search_param(params),
-        take=_int_param(params, "take"),
+        filter_param=_json_param(params.get("filter"), "filter", "object"),
+        search=search,
+        take=int(take) if take is not None else None,
         skip=skip,
-        order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy"), "orderBy"),
-        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy"), "groupBy"),
+        order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy", "array"), "orderBy"),
+        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy", "array"), "groupBy"),
         view_id=params.get("viewId"),
         ignore_view_query=_ignore_view_query(params),
     )
@@ -298,13 +333,13 @@ async def get_search_index(tableId: str, request: Request):
 async def get_group_points(tableId: str, request: Request) -> list[dict[str, Any]]:
     params = request.query_params
     filter_param, tql = _tql_or_filter(params)
-    collapsed_raw = _json_param(params.get("collapsedGroupIds"), "collapsedGroupIds")
+    collapsed_raw = _json_param(params.get("collapsedGroupIds"), "collapsedGroupIds", "array")
     return await AggregationService().get_group_points(
         tableId,
         filter_param=filter_param,
         tql=tql,
         search=_search_param(params),
-        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy"), "groupBy"),
+        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy", "array"), "groupBy"),
         collapsed_ids=collapsed_raw,
         view_id=params.get("viewId"),
         ignore_view_query=_ignore_view_query(params),
@@ -335,7 +370,7 @@ async def get_calendar_daily_collection(tableId: str, request: Request) -> dict[
         end_date=params["endDate"],
         start_field_id=params["startDateFieldId"],
         end_field_id=params["endDateFieldId"],
-        filter_param=_json_param(params.get("filter"), "filter"),
+        filter_param=_json_param(params.get("filter"), "filter", "object"),
         search=_search_param(params),
         view_id=params.get("viewId"),
         ignore_view_query=_ignore_view_query(params),
@@ -355,9 +390,9 @@ async def get_selection_aggregation(tableId: str, request: Request) -> dict[str,
         tql=tql,
         search=_search_param(params),
         view_id=params.get("viewId"),
-        order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy"), "orderBy"),
-        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy"), "groupBy"),
-        collapsed_ids=_json_param(params.get("collapsedGroupIds"), "collapsedGroupIds"),
+        order_by=_sort_items(_json_param(params.get("orderBy"), "orderBy", "array"), "orderBy"),
+        group_by=_sort_items(_json_param(params.get("groupBy"), "groupBy", "array"), "groupBy"),
+        collapsed_ids=_json_param(params.get("collapsedGroupIds"), "collapsedGroupIds", "array"),
         skip=_bounded_int(params, "skip", minimum=0, default=0),
         take=_bounded_int(params, "take", minimum=1, default=None),
         ignore_view_query=_ignore_view_query(params),
