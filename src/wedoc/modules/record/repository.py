@@ -95,6 +95,11 @@ async def fetch_column_by_ids(
 
 
 async def insert_row(base_id: str, table_id: str, values: dict[str, Any]) -> None:
+    # The reference stamps __last_modified_time/__last_modified_by on insert too,
+    # so a freshly created record already reports its modification metadata.
+    values = dict(values)
+    values.setdefault("__last_modified_time", values.get("__created_time"))
+    values.setdefault("__last_modified_by", values.get("__created_by"))
     cols = ", ".join(f'"{c}"' for c in values)
     names = ", ".join(f":v{i}" for i in range(len(values)))
     sql = f"INSERT INTO {_q(base_id, table_id)} ({cols}) VALUES ({names})"
