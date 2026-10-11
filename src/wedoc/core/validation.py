@@ -321,7 +321,10 @@ def _translate(
     """One Pydantic error dict -> [(zod message, zod path)]."""
     err_type: str = err.get("type", "")
     ctx: dict[str, Any] = err.get("ctx") or {}
-    loc = tuple(p for p in err.get("loc", ()) if p not in ("body", "query", "params"))
+    loc = tuple(err.get("loc", ()))
+    # Only FastAPI adds a source prefix; model fields can themselves be named params/query.
+    if model is None and loc and loc[0] in ("body", "query", "path", "header", "cookie"):
+        loc = loc[1:]
     input_value = err.get("input")
 
     def one(message: str) -> list[tuple[str, tuple[Any, ...]]]:

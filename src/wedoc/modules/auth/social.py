@@ -116,8 +116,8 @@ async def _callback(provider: str, request: Request) -> Response:
     profile = await _exchange_and_fetch_profile(provider, code)
     user = await _find_or_create_user(provider, profile)
 
-    from ...core.security.auth import session_login
     from ..user.service import UserService
+    from .service import session_login
 
     await UserService().refresh_last_sign_time(user["id"])
     response = RedirectResponse(

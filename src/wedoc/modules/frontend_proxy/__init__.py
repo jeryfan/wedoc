@@ -8,12 +8,16 @@ Registered LAST so every /api/* and /socket route wins first.
 from __future__ import annotations
 
 import httpx
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from ...config import get_settings
 from ...core.cache import get_cache
 from ...core.ids import IdPrefix, new_id
+from ...core.security.auth import auth_guard
+from ...core.security.permissions import permission_guard
+from ...core.validation import read_json_body
+from .schemas import SaveQueryParamsBody
 
 router = APIRouter()
 
@@ -66,22 +70,16 @@ _HOP_BY_HOP = {
 }
 
 
-@router.post("/api/query-params")
+@router.post(
+    "/api/query-params",
+    status_code=201,
+    dependencies=[Depends(auth_guard), Depends(permission_guard)],
+)
 async def save_query_params(request: Request) -> Response:
-    body = await request.json()
-    params = body.get("params") if isinstance(body, dict) else None
-    if not isinstance(params, dict):
-        return JSONResponse(
-            status_code=400,
-            content={
-                "message": 'Validation error: Required at "params"',
-                "status": 400,
-                "code": "validation_error",
-            },
-        )
+    body = SaveQueryParamsBody.zod_validate(await read_json_body(request))
     query_id = new_id(IdPrefix.QUERY)
-    await get_cache().set_detail(f"query-params:{query_id}", params, QUERY_PARAMS_TTL)
-    return JSONResponse({"queryId": query_id})
+    await get_cache().set_detail(f"query-params:{query_id}", body.params, QUERY_PARAMS_TTL)
+    return JSONResponse({"queryId": query_id}, status_code=201)
 
 
 def _proxied(path: str) -> bool:
