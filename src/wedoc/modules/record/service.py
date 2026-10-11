@@ -2428,6 +2428,7 @@ class RecordService:
         coll_cache: dict[str, Any] = {}
         columns = [f["db_field_name"] for f in fields]
         records_vo = []
+        create_history_rows: list[dict[str, Any]] = []
         created_ops: list[dict[str, Any]] = []
         computed_rows: list[dict[str, Any]] = []
         order_column: str | None = None
@@ -2488,6 +2489,30 @@ class RecordService:
             for ctx, new_ids in link_writes:
                 await self._sync_link_write(table, ctx, record_id, [], new_ids, self_primary_col)
             row = await repository.fetch_row(table["base_id"], table_id, record_id, columns)
+            # A batched create (2+ records) logs cell history (null -> value) in
+            # the reference; a single-record create does not.
+            if len(body.records) > 1:
+                fields_by_id = {f["id"]: f for f in fields}
+                for field_id, value in id_fields.items():
+                    if value is None:
+                        continue
+                    field = fields_by_id.get(field_id)
+                    if field is None or _is_computed_field(field):
+                        continue
+                    entry = build_history_row(
+                        table_id=table_id,
+                        record_id=record_id,
+                        field_id=field["id"],
+                        name=field["name"],
+                        field_type=field["type"],
+                        options_raw=field.get("options"),
+                        cell_value_type=field["cell_value_type"],
+                        before=None,
+                        after=value,
+                        user_id=user_id,
+                    )
+                    if entry:
+                        create_history_rows.append(entry)
             records_vo.append(self._full_vo(row, fields, body.fieldKeyType))
             computed_rows.append(row)
             created_ops.append({"id": record_id, "fields": id_fields})
@@ -2501,6 +2526,14 @@ class RecordService:
         await self._apply_computed_fields(
             fields, computed_rows, records_vo, fields, body.fieldKeyType
         )
+        if create_history_rows:
+            created_time = datetime.now(UTC).replace(tzinfo=None)
+            for row, hid in zip(
+                create_history_rows, sorted(r["id"] for r in create_history_rows), strict=True
+            ):
+                row["created_time"] = created_time
+                row["id"] = hid
+            await repository.insert_history(create_history_rows)
         created_ids = [op["id"] for op in created_ops]
         await self._materialize_computed(table, fields, created_ids)
         await self._recompute_dependents(table_id, created_ids)
