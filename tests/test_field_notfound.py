@@ -18,7 +18,7 @@ async def _table(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     bid = (await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"}))["id"]
-    return (await _create(client, f"/api/base/{bid}/table", {"name": "TA"}))["id"]
+    return (await _create(client, f"/api/base/{bid}/table", {"name": "TA", "records": []}))["id"]
 
 
 async def test_convert_missing_field_in_table(client):

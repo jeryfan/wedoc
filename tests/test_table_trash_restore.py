@@ -20,7 +20,7 @@ async def test_table_restore_brings_table_back(client):
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
     bid = base["id"]
-    table = await _create(client, f"/api/base/{bid}/table", {"name": "T"})
+    table = await _create(client, f"/api/base/{bid}/table", {"name": "T", "records": []})
     tid = table["id"]
 
     # delete the table
@@ -48,7 +48,7 @@ async def test_record_restore_reinserts_from_snapshot(client):
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
     bid = base["id"]
-    tid = (await _create(client, f"/api/base/{bid}/table", {"name": "T"}))["id"]
+    tid = (await _create(client, f"/api/base/{bid}/table", {"name": "T", "records": []}))["id"]
     rid = (await _create(client, f"/api/table/{tid}/record",
         {"fieldKeyType": "name", "records": [{"fields": {"Name": "keep", "Count": 42}}]}
     ))["records"][0]["id"]

@@ -18,7 +18,7 @@ async def _setup_field(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     field = await _create(
         client, f"/api/table/{table['id']}/field", {"type": "singleLineText", "name": "F"}
     )
@@ -59,7 +59,7 @@ async def test_number_to_select_uses_raw_numeric_string(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -102,7 +102,9 @@ async def _text_field_with(client, values):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    tid = (await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"}))["id"]
+    tid = (
+        await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
+    )["id"]
     fid = (await _create(
         client, f"/api/table/{tid}/field", {"type": "singleLineText", "name": "F"}
     ))["id"]
@@ -190,7 +192,9 @@ async def _field_with(client, ftype, options, values):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    tid = (await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"}))["id"]
+    tid = (
+        await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
+    )["id"]
     body = {"type": ftype, "name": "F"}
     if options:
         body["options"] = options

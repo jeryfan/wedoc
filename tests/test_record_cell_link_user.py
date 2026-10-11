@@ -17,8 +17,8 @@ async def _setup(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     bid = (await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"}))["id"]
-    ta = (await _create(client, f"/api/base/{bid}/table", {"name": "TA"}))["id"]
-    tb = (await _create(client, f"/api/base/{bid}/table", {"name": "TB"}))["id"]
+    ta = (await _create(client, f"/api/base/{bid}/table", {"name": "TA", "records": []}))["id"]
+    tb = (await _create(client, f"/api/base/{bid}/table", {"name": "TB", "records": []}))["id"]
     link = (await _create(client, f"/api/table/{ta}/field",
         {"name": "Link", "type": "link",
          "options": {"relationship": "manyOne", "foreignTableId": tb}}))["id"]
@@ -85,8 +85,8 @@ async def test_manymany_missing_record_rejected(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     bid = (await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"}))["id"]
-    tb = (await _create(client, f"/api/base/{bid}/table", {"name": "TB"}))["id"]
-    ta = (await _create(client, f"/api/base/{bid}/table", {"name": "TA"}))["id"]
+    tb = (await _create(client, f"/api/base/{bid}/table", {"name": "TB", "records": []}))["id"]
+    ta = (await _create(client, f"/api/base/{bid}/table", {"name": "TA", "records": []}))["id"]
     lf = (await _create(client, f"/api/table/{ta}/field",
         {"name": "Link", "type": "link",
          "options": {"relationship": "manyMany", "foreignTableId": tb}}))["id"]

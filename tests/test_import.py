@@ -19,7 +19,9 @@ async def test_import_patch_rejects_cross_base_table(client):
     space = await _create(client, "/api/space", {"name": "S"})
     base_a = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
     base_b = await _create(client, "/api/base", {"spaceId": space["id"], "name": "B"})
-    table_a = await _create(client, f"/api/base/{base_a['id']}/table", {"name": "T1"})
+    table_a = await _create(
+        client, f"/api/base/{base_a['id']}/table", {"name": "T1", "records": []}
+    )
 
     # a table belonging to base A cannot be imported into base B (cross-tenant write)
     resp = await client.patch(f"/api/import/{base_b['id']}/{table_a['id']}", json={})
@@ -46,7 +48,9 @@ async def test_import_patch_stream_scope_guard_precedes_stream(client):
     space = await _create(client, "/api/space", {"name": "S"})
     base_a = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
     base_b = await _create(client, "/api/base", {"spaceId": space["id"], "name": "B"})
-    table_a = await _create(client, f"/api/base/{base_a['id']}/table", {"name": "T1"})
+    table_a = await _create(
+        client, f"/api/base/{base_a['id']}/table", {"name": "T1", "records": []}
+    )
 
     # the guard runs before the SSE handler, so this is a 404 JSON, not an error event
     resp = await client.patch(
@@ -61,7 +65,7 @@ async def test_import_patch_same_base_passes_scope_guard(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
 
     # in-base table clears the guard (reaches body validation, not a scope 404)
     resp = await client.patch(f"/api/import/{base['id']}/{table['id']}", json={})

@@ -14,7 +14,7 @@ async def test_node_list_avatar_full_url_and_int_order(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     bid = (await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"}))["id"]
-    await _create(client, f"/api/base/{bid}/table", {"name": "TA"})
+    await _create(client, f"/api/base/{bid}/table", {"name": "TA", "records": []})
     nodes = (await client.get(f"/api/base/{bid}/node/list")).json()
     assert len(nodes) == 1
     node = nodes[0]

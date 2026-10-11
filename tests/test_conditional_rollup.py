@@ -21,8 +21,8 @@ async def _setup(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    t1 = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
-    t2 = await _create(client, f"/api/base/{base['id']}/table", {"name": "T2"})
+    t1 = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
+    t2 = await _create(client, f"/api/base/{base['id']}/table", {"name": "T2", "records": []})
     t2_field_rows = (await client.get(f"/api/table/{t2['id']}/field")).json()
     t2_fields = {f["name"]: f["id"] for f in t2_field_rows}
     await _create(

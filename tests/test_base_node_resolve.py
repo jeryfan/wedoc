@@ -16,7 +16,9 @@ async def _base(client):
 
 async def test_get_node_by_resource_id_and_node_id(client):
     bid = await _base(client)
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})).json(
+        
+    )["id"]
     nodes = (await client.get(f"/api/base/{bid}/node/list")).json()
     node_id = nodes[0]["id"]
 

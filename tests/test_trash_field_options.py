@@ -13,7 +13,8 @@ async def _table(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "B"})).json()["id"]
-    return bid, (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    table = await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})
+    return bid, table.json()["id"]
 
 
 async def _trashed_field_options(client, tid, spec):

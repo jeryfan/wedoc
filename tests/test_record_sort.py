@@ -29,7 +29,7 @@ async def test_single_select_sorts_by_choice_order(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -80,7 +80,7 @@ async def test_multi_select_sorts_by_choice_index_array(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")

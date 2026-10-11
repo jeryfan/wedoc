@@ -25,7 +25,12 @@ async def test_create_table_shape(client):
         "records",
         "views",
     ]
-    assert body["records"] == []
+    assert len(body["records"]) == 3
+    # create-table echoes every field of the new table as null for blank rows
+    assert all(set(record["fields"]) == {"Name", "Count", "Status"} for record in body["records"])
+    assert all(value is None for record in body["records"] for value in record["fields"].values())
+    explicit = await client.post(f"/api/base/{bid}/table", json={"name": "T2", "records": []})
+    assert explicit.json()["records"] == []
     assert len(body["views"]) == 1
     assert body["views"][0]["type"] == "grid"
 
@@ -41,7 +46,9 @@ async def test_get_table_missing(client):
 
 async def test_default_view_id(client):
     bid = await _base(client)
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})).json(
+        
+    )["id"]
     resp = await client.get(f"/api/base/{bid}/table/{tid}/default-view-id")
     assert resp.status_code == 200, resp.text
     assert resp.json()["id"].startswith("viw")
@@ -49,7 +56,9 @@ async def test_default_view_id(client):
 
 async def test_db_table_name_bad_format(client):
     bid = await _base(client)
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})).json(
+        
+    )["id"]
     resp = await client.put(
         f"/api/base/{bid}/table/{tid}/db-table-name", json={"dbTableName": "1bad-name!"}
     )

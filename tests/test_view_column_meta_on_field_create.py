@@ -20,7 +20,7 @@ async def _setup(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     return base["id"], table["id"]
 
 
@@ -55,7 +55,7 @@ async def test_link_field_in_own_view_but_symmetric_field_not_in_foreign_view(cl
     # but the auto-created symmetric field is a real field on the foreign table
     # WITHOUT any entry in that table's view columnMeta.
     base_id, tid = await _setup(client)
-    other = await _create(client, f"/api/base/{base_id}/table", {"name": "T2"})
+    other = await _create(client, f"/api/base/{base_id}/table", {"name": "T2", "records": []})
     other_id = other["id"]
     foreign_before = (await _grid_view(client, other_id))["columnMeta"]
 

@@ -14,7 +14,9 @@ async def _table_with_groups(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "B"})).json()["id"]
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})).json(
+        
+    )["id"]
     flds = (await client.get(f"/api/table/{tid}/field")).json()
     status = next(f for f in flds if f["type"] == "singleSelect")
     choices = [ch["name"] for ch in status["options"]["choices"]]

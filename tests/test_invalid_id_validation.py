@@ -18,7 +18,9 @@ async def _setup(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "B"})).json()["id"]
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})).json(
+        
+    )["id"]
     fname = (await client.get(f"/api/table/{tid}/field")).json()[0]["name"]
     return tid, fname
 

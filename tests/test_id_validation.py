@@ -16,7 +16,9 @@ async def _table(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    return (await _create(client, f"/api/base/{base['id']}/table", {"name": "T"}))["id"]
+    return (
+        await _create(client, f"/api/base/{base['id']}/table", {"name": "T", "records": []})
+    )["id"]
 
 
 async def test_malformed_ids_return_400_invalid(client):

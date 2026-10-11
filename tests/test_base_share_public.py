@@ -12,7 +12,9 @@ async def _shared(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "B"})).json()["id"]
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "T1", "records": []})).json(
+        
+    )["id"]
     node = (await client.get(f"/api/base/{bid}/node/list")).json()[0]["id"]
     shid = (await client.post(f"/api/base/{bid}/share", json={"nodeId": node})).json()["shareId"]
     return bid, tid, shid

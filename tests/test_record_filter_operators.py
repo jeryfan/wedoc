@@ -20,7 +20,7 @@ async def _setup(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -96,7 +96,7 @@ async def _setup_user(client):
     uid = (await client.get("/api/auth/user")).json()["id"]
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -137,7 +137,7 @@ async def _setup_multi_user(client):
     uid = (await client.get("/api/auth/user")).json()["id"]
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -182,7 +182,7 @@ async def _setup_system_user(client, field_type):
     uid = (await client.get("/api/auth/user")).json()["id"]
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -220,7 +220,7 @@ async def _setup_system_time(client, field_type):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -251,7 +251,7 @@ async def _num_and_checkbox(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     num = (
         await _create(client, f"/api/table/{tid}/field", {"name": "Num", "type": "number"})

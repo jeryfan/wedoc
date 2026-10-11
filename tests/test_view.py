@@ -14,7 +14,9 @@ async def _view(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "A"})).json()["id"]
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "TA"})).json()["id"]
+    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "TA", "records": []})).json(
+        
+    )["id"]
     vid = (await client.get(f"/api/table/{tid}/view")).json()[0]["id"]
     fid = (await client.get(f"/api/table/{tid}/field")).json()[0]["id"]
     return tid, vid, fid

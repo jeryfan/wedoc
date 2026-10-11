@@ -24,7 +24,7 @@ async def _formula_cells(client, name_value, exprs):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")
@@ -91,7 +91,7 @@ async def _compute(client, exprs):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     name_id = next(
         f["id"] for f in (await client.get(f"/api/table/{tid}/field")).json() if f.get("isPrimary")

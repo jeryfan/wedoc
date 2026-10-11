@@ -16,7 +16,9 @@ async def _table_with_rows(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "A"})).json()["id"]
-    tid = (await client.post(f"/api/base/{bid}/table", json={"name": "TA"})).json()["id"]
+    tid = (
+        await client.post(f"/api/base/{bid}/table", json={"name": "TA", "records": []})
+    ).json()["id"]
     for nm in ("apple", "banana"):
         await client.post(
             f"/api/table/{tid}/record",

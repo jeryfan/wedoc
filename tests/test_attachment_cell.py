@@ -15,7 +15,9 @@ async def test_upload_attachment_echo_has_presigned_url(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    tid = (await _create(client, f"/api/base/{base['id']}/table", {"name": "T"}))["id"]
+    tid = (
+        await _create(client, f"/api/base/{base['id']}/table", {"name": "T", "records": []})
+    )["id"]
     fid = (await _create(
         client, f"/api/table/{tid}/field", {"name": "Att", "type": "attachment"}
     ))["id"]

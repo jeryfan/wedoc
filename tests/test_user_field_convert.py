@@ -17,7 +17,9 @@ async def _setup(client):
     me = (await client.get("/api/auth/user")).json()
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    tid = (await _create(client, f"/api/base/{base['id']}/table", {"name": "T"}))["id"]
+    tid = (
+        await _create(client, f"/api/base/{base['id']}/table", {"name": "T", "records": []})
+    )["id"]
     return tid, me["id"], me["name"], email
 
 

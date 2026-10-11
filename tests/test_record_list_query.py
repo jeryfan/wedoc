@@ -21,7 +21,9 @@ async def _table(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "A"})).json()["id"]
-    return (await client.post(f"/api/base/{bid}/table", json={"name": "TA"})).json()["id"]
+    return (await client.post(f"/api/base/{bid}/table", json={"name": "TA", "records": []})).json(
+        
+    )["id"]
 
 
 async def test_field_key_type_bad(client):

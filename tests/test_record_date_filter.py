@@ -36,7 +36,7 @@ async def _setup(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     base = await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"})
-    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1"})
+    table = await _create(client, f"/api/base/{base['id']}/table", {"name": "T1", "records": []})
     tid = table["id"]
     # wedoc defaults a date field's formatting.timeZone to UTC, which is what the
     # range resolver reads — keeping this deterministic without pinning options.

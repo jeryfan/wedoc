@@ -12,7 +12,9 @@ async def _table(client):
     await _signup(client)
     sid = (await client.post("/api/space", json={"name": "S"})).json()["id"]
     bid = (await client.post("/api/base", json={"spaceId": sid, "name": "B"})).json()["id"]
-    return (await client.post(f"/api/base/{bid}/table", json={"name": "T"})).json()["id"]
+    return (await client.post(f"/api/base/{bid}/table", json={"name": "T", "records": []})).json(
+        
+    )["id"]
 
 
 async def _published_plugin_id(client):

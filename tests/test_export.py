@@ -23,7 +23,7 @@ async def test_export_csv_body(client):
     await _signup(client)
     space = await _create(client, "/api/space", {"name": "S"})
     bid = (await _create(client, "/api/base", {"spaceId": space["id"], "name": "A"}))["id"]
-    ta = (await _create(client, f"/api/base/{bid}/table", {"name": "TA"}))["id"]
+    ta = (await _create(client, f"/api/base/{bid}/table", {"name": "TA", "records": []}))["id"]
     await _create(client, f"/api/table/{ta}/record",
                   {"fieldKeyType": "name", "records": [{"fields": {"Name": "apple"}}]})
     resp = await client.get(f"/api/export/{ta}")

@@ -215,10 +215,14 @@ class TableService:
             [_raw(f) for f in body.fields] if body.fields else [dict(f) for f in DEFAULT_FIELDS]
         )
         view_ros = [_raw(v) for v in body.views] if body.views else [dict(v) for v in DEFAULT_VIEWS]
-        # v2 createTable seeds NO default records (verified against the reference:
-        # a fresh table has rowCount 0). Records are created only when the caller
-        # supplies them (duplicate/import/apply-template pass an explicit list).
-        record_ros = [_raw(r) for r in body.records] if body.records else []
+        # table.pipe.helper.ts: `records: tableRo.records ? tableRo.records : DEFAULT_RECORD_DATA`
+        # so an omitted key seeds the canonical three blank rows while an explicit
+        # empty list creates none.
+        record_ros = (
+            [_raw(r) for r in body.records]
+            if body.records is not None
+            else [{"fields": {}} for _ in range(3)]
+        )
 
         if not any(f.get("isPrimary") for f in field_ros):
             field_ros[0]["isPrimary"] = True
