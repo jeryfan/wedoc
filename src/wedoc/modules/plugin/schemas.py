@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 from pydantic import StrictBool, field_validator
 
-from ...core.validation import ZodEnumStr, ZodExpected, ZodModel
+from ...core.validation import ZodEnumStr, ZodExpected, ZodModel, js_length
 
 PLUGIN_POSITIONS = ["dashboard", "view", "contextMenu", "panel"]
 PositionStr = ZodEnumStr(PLUGIN_POSITIONS)
@@ -83,9 +83,9 @@ class CreatePluginRo(ZodModel):
     @field_validator("name")
     @classmethod
     def _name(cls, v: str) -> str:
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(v) > 20:
+        if js_length(v) > 20:
             raise ValueError("Too big: expected string to have <=20 characters")
         return v
 

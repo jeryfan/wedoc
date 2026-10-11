@@ -10,7 +10,14 @@ from typing import Annotated, Any
 
 from pydantic import Field, StrictBool, field_validator
 
-from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel, ZodNonOptional, ZodNullable
+from ...core.validation import (
+    ZodEmailStr,
+    ZodEnumStr,
+    ZodModel,
+    ZodNonOptional,
+    ZodNullable,
+    js_length,
+)
 
 _NullableMailConfig = Annotated[dict[str, Any] | None, ZodNullable()]
 
@@ -138,8 +145,8 @@ class AdminSendNotificationRo(ZodModel):
     @field_validator("message")
     @classmethod
     def _message(cls, value: str) -> str:
-        if len(value) < 1:
+        if js_length(value) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(value) > 5000:
+        if js_length(value) > 5000:
             raise ValueError("Too big: expected string to have <=5000 characters")
         return value

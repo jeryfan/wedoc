@@ -4,7 +4,7 @@ from typing import Annotated, Any
 
 from pydantic import StrictBool, field_validator
 
-from ...core.validation import ZodEnumStr, ZodExpected, ZodModel
+from ...core.validation import ZodEnumStr, ZodExpected, ZodModel, js_length
 
 USER_NAME_MAX_LENGTH = 100
 
@@ -41,9 +41,9 @@ class UpdateUserNameBody(ZodModel):
     @field_validator("name")
     @classmethod
     def _name(cls, v: str) -> str:
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(v) > USER_NAME_MAX_LENGTH:
+        if js_length(v) > USER_NAME_MAX_LENGTH:
             raise ValueError("Too big: expected string to have <=100 characters")
         return v
 
@@ -64,9 +64,9 @@ class TrackEventBody(ZodModel):
     @field_validator("event")
     @classmethod
     def _event(cls, v: str) -> str:
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(v) > 100:
+        if js_length(v) > 100:
             raise ValueError("Too big: expected string to have <=100 characters")
         return v
 

@@ -5,7 +5,14 @@ from typing import Annotated, Any
 
 from pydantic import BeforeValidator, StrictBool, field_validator
 
-from ...core.validation import ZodEnumStr, ZodExpected, ZodModel, ZodMultiError, ZodNullableStr
+from ...core.validation import (
+    ZodEnumStr,
+    ZodExpected,
+    ZodModel,
+    ZodMultiError,
+    ZodNullableStr,
+    js_length,
+)
 
 # create() allows a letter start only; the db-table-name endpoint also allows "_".
 # re.ASCII keeps \w to [A-Za-z0-9_] so it tracks the JS /i regex (no Unicode words).
@@ -107,7 +114,7 @@ class FieldRoBody(ZodModel):
         if not isinstance(v, str):
             return v
         trimmed = v.strip()
-        if len(trimmed) < 1:
+        if js_length(trimmed) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
         return trimmed
 
@@ -143,7 +150,7 @@ class CreateTableBody(ZodModel):
         # tableFullVoSchema.shape.name.min(1).optional(): min(1), no trim.
         if v is None or not isinstance(v, str):
             return v
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
         return v
 

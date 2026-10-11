@@ -4,14 +4,14 @@ from typing import Annotated
 
 from pydantic import AfterValidator, StrictBool
 
-from ...core.validation import ZodExpected, ZodModel, ZodNullable
+from ...core.validation import ZodExpected, ZodModel, ZodNullable, js_length
 
 
 def _share_password(value: str | None) -> str | None:
     # sharePasswordSchema: z.string().min(3)
     if value is None:
         return value
-    if len(value) < 3:
+    if js_length(value) < 3:
         raise ValueError("Too small: expected string to have >=3 characters")
     return value
 

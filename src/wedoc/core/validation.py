@@ -24,6 +24,7 @@ verbatim.
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cache
 from typing import Annotated, Any
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, ValidationError
@@ -36,8 +37,22 @@ ZOD_EMAIL_RE = re.compile(
     r"^(?!\.)(?!.*\.\.)[A-Za-z0-9_'+\-.]*[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$"
 )
 
-# packages/openapi auth/types.ts signupPasswordSchema
-SIGNUP_PASSWORD_RE = re.compile(r"^(?=.*[A-Z])(?=.*\d).{8,}$", re.IGNORECASE)
+# packages/openapi auth/types.ts signupPasswordSchema. JS regexes run over UTF-16
+# code units and `.` excludes line terminators, so both are reproduced here.
+_JS_DOT = r"[^\n\r\u2028\u2029]"
+SIGNUP_PASSWORD_RE = re.compile(
+    rf"^(?={_JS_DOT}*[A-Z])(?={_JS_DOT}*\d){_JS_DOT}{{8,}}\Z",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def js_regex_search(value: str, pattern: re.Pattern[str]) -> bool:
+    """Match a JS-flavoured pattern against the value's UTF-16 code units."""
+    units = value.encode("utf-16-le", errors="surrogatepass")
+    code_units = "".join(
+        chr(int.from_bytes(units[i : i + 2], "little")) for i in range(0, len(units), 2)
+    )
+    return pattern.match(code_units) is not None
 SIGNUP_PASSWORD_MESSAGE = "Must contain at least one letter and one number"
 
 
@@ -71,12 +86,21 @@ class ZodNonOptional:
 ZodNullableStr = Annotated[str | None, ZodNullable()]
 
 
+def js_length(value: str) -> int:
+    """JavaScript ``String.prototype.length``: UTF-16 code units, not code points.
+
+    zod's ``.min()``/``.max()`` measure JS string length, so an astral character
+    (emoji) counts as two. Ported validators must use this instead of ``len``.
+    """
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
 def zod_password_checks(value: str, *, strength: bool) -> str:
     """passwordSchema (min 8) + optional signupPasswordSchema strength regex."""
     messages: list[str] = []
-    if len(value) < 8:
+    if js_length(value) < 8:
         messages.append("Too small: expected string to have >=8 characters")
-    if strength and not SIGNUP_PASSWORD_RE.match(value):
+    if strength and not js_regex_search(value, SIGNUP_PASSWORD_RE):
         messages.append(SIGNUP_PASSWORD_MESSAGE)
     if messages:
         if len(messages) == 1:
@@ -448,74 +472,163 @@ def _translate(
     return one(err.get("msg", "Invalid input"))
 
 
-def format_zod_errors(model: type[BaseModel] | None, errors: list[dict[str, Any]]) -> str:
-    """zod-validation-error v4 messageBuilder: title-cased issues, '; '-joined."""
-    parts: list[str] = []
+def _order_key(
+    model: type[BaseModel] | None, loc: tuple[Any, ...]
+) -> tuple[tuple[int, int], ...]:
+    """Sort key placing issues in zod's schema order (fields, then list indices)."""
+    key: list[tuple[int, int]] = []
+    node: Any = model
+    for part in loc:
+        if isinstance(part, int):
+            key.append((1, part))
+            continue
+        fields = getattr(node, "model_fields", None) or {}
+        names = list(fields.keys())
+        key.append((0, names.index(part) if part in names else len(names)))
+        field = fields.get(part)
+        node = _unwrap_union(field.annotation) if field is not None else None
+        args = getattr(node, "__args__", None)
+        if getattr(node, "__origin__", None) is list and args:
+            node = _unwrap_union(args[0])
+    return tuple(key)
+
+
+def format_zod_errors(
+    model: type[BaseModel] | None,
+    errors: list[dict[str, Any]],
+    synthetic: list[tuple[tuple[Any, ...], str]] | None = None,
+) -> str:
+    """zod-validation-error v4 messageBuilder: title-cased issues, '; '-joined.
+
+    ``synthetic`` carries issues zod would raise that Pydantic accepts silently
+    (explicit nulls on optional fields, the plain-object record check). They are
+    merged into zod's schema order; issues for the same field keep the order
+    Pydantic reported them in.
+    """
+    entries: list[tuple[tuple[tuple[int, int], ...], str, tuple[Any, ...]]] = []
+    synthetic = synthetic or []
     for err in errors[:99]:
         for message, loc in _translate(model, err):
-            if message:
-                message = message[0].upper() + message[1:]
-            if loc:
-                message += f' at "{_join_path(loc)}"'
-            parts.append(message)
+            entries.append((_order_key(model, loc), message, loc))
+    for loc, message in synthetic:
+        entries.append((_order_key(model, loc), message, loc))
+    entries.sort(key=lambda item: item[0])
+    parts: list[str] = []
+    for _key, message, loc in entries[:99]:
+        if message:
+            message = message[0].upper() + message[1:]
+        if loc:
+            message += f' at "{_join_path(loc)}"'
+        parts.append(message)
     return "Validation error: " + "; ".join(parts)
 
 
 MAX_ERROR_LENGTH = 1000  # ZodValidationPipe truncates past this
 
 
-def _reject_js_constructor(model: type[BaseModel], data: Any, loc: tuple[Any, ...]) -> None:
-    """zod plain-object check: a record whose own ``constructor`` is not Object fails.
+_BOUND_MESSAGE = re.compile(r"Too (?:small|big): expected string to have >=?(\d+)")
 
-    zod decides a value is a plain object with ``proto === null || proto.constructor === Object``;
-    qs/JSON bodies can carry an own ``constructor`` key, which then reports
-    ``expected record, received object``. Emulated here for dict-typed fields.
+
+@cache
+def _string_bounds(model: type[BaseModel], name: str) -> tuple[int | None, int | None]:
+    """zod ``.min()``/``.max()`` bounds of a string field, recovered from its validators.
+
+    zod keeps running length checks when the type check fails and reports the
+    bound against the array (``Too small: expected array to have >=8 items``).
+    Probing the ported validator keeps that bound from drifting away from the
+    validator itself; validators are pure functions of the field value.
     """
-    if not isinstance(data, dict):
-        return
-    for name, field_info in model.model_fields.items():
-        if name not in data or not isinstance(data[name], dict):
+    minimum: int | None = None
+    maximum: int | None = None
+    decorators = getattr(model, "__pydantic_decorators__", None)
+    validators = getattr(decorators, "field_validators", None) or {}
+    for validator_name, decorator in validators.items():
+        info = getattr(decorator, "info", None)
+        if name not in tuple(getattr(info, "fields", None) or ()):
             continue
-        node = _unwrap_union(field_info.annotation)
+        func = getattr(model, validator_name, None)
+        if func is None:
+            continue
+        for probe in ("", "x" * 100_000):
+            try:
+                func(probe)
+            except Exception as exc:  # ported zod checks raise ValueError subclasses
+                messages = getattr(exc, "messages", None) or [str(exc)]
+                for message in messages:
+                    match = _BOUND_MESSAGE.search(str(message))
+                    if not match:
+                        continue
+                    bound = int(match.group(1))
+                    if str(message).startswith("Too small"):
+                        minimum = max(minimum or 0, bound)
+                    else:
+                        maximum = bound if maximum is None else min(maximum, bound)
+    return minimum, maximum
+
+
+def _synthetic_issues(
+    model: type[BaseModel], data: Any, loc: tuple[Any, ...] = ()
+) -> list[tuple[tuple[Any, ...], str]]:
+    """Issues zod reports that Pydantic accepts: nulls, record shape, array bounds."""
+    issues: list[tuple[tuple[Any, ...], str]] = []
+    if not isinstance(data, dict):
+        return issues
+    for name, field_info in model.model_fields.items():
+        if name not in data:
+            continue
+        value = data[name]
         path = (*loc, name)
-        expected = _field_expected(model, path) or "record"
-        if getattr(node, "__origin__", None) is dict and "constructor" in data[name]:
-            raise ApiError(
-                "Validation error: Invalid input: "
-                f'expected {expected}, received object at "{_join_path(path)}"',
-                HttpErrorCode.VALIDATION_ERROR,
-            )
+        node = _unwrap_union(field_info.annotation)
+        nullable = any(isinstance(m, ZodNullable) for m in field_info.metadata)
+        if (
+            value is None
+            and not nullable
+            and not field_info.is_required()
+            and field_info.default is None
+        ):
+            expected = _field_expected(model, (name,)) or "undefined"
+            issues.append((path, f"Invalid input: expected {expected}, received null"))
+            continue
+        if getattr(node, "__origin__", None) is dict and isinstance(value, dict):
+            if "constructor" in value:
+                expected = _field_expected(model, (name,)) or "record"
+                issues.append(
+                    (path, f"Invalid input: expected {expected}, received object")
+                )
+        if isinstance(value, list) and node is str:
+            minimum, maximum = _string_bounds(model, name)
+            if minimum is not None and len(value) < minimum:
+                issues.append((path, f"Too small: expected array to have >={minimum} items"))
+            if maximum is not None and len(value) > maximum:
+                issues.append((path, f"Too big: expected array to have <={maximum} items"))
         if isinstance(node, type) and issubclass(node, BaseModel):
-            _reject_js_constructor(node, data[name], path)
+            issues.extend(_synthetic_issues(node, value, path))
+        elif getattr(node, "__origin__", None) is list and getattr(node, "__args__", None):
+            item = _unwrap_union(node.__args__[0])
+            if isinstance(item, type) and issubclass(item, BaseModel) and isinstance(value, list):
+                for index, entry in enumerate(value):
+                    issues.extend(_synthetic_issues(item, entry, (*path, index)))
+    return issues
 
 
 def zod_validate(model: type[BaseModel], data: Any) -> Any:
-    # zod `.optional()` accepts absence but rejects explicit null; Pydantic's
-    # `X | None` accepts both, so reject nulls up front with zod's wording.
-    _reject_js_constructor(model, data, ())
-    if isinstance(data, dict):
-        for name, field_info in model.model_fields.items():
-            nullable = any(isinstance(m, ZodNullable) for m in field_info.metadata)
-            if (
-                not nullable
-                and name in data
-                and data[name] is None
-                and not field_info.is_required()
-                and field_info.default is None
-            ):
-                expected = _field_expected(model, (name,)) or "undefined"
-                raise ApiError(
-                    "Validation error: Invalid input: "
-                    f"expected {expected}, received null at \"{name}\"",
-                    HttpErrorCode.VALIDATION_ERROR,
-                )
+    # zod `.optional()` accepts absence but rejects explicit null, and its checks
+    # keep running on wrongly typed values; Pydantic stops earlier, so the extra
+    # issues are collected here and merged into zod's order.
+    synthetic = _synthetic_issues(model, data)
     try:
-        return model.model_validate(data)
+        result = model.model_validate(data)
     except ValidationError as exc:
-        message = format_zod_errors(model, exc.errors())
+        message = format_zod_errors(model, exc.errors(), synthetic)
         if len(message) > MAX_ERROR_LENGTH:
             message = message[:MAX_ERROR_LENGTH] + "... (truncated)"
         raise ApiError(message, HttpErrorCode.VALIDATION_ERROR) from exc
+    if synthetic:
+        message = format_zod_errors(model, [], synthetic)
+        if len(message) > MAX_ERROR_LENGTH:
+            message = message[:MAX_ERROR_LENGTH] + "... (truncated)"
+        raise ApiError(message, HttpErrorCode.VALIDATION_ERROR)
+    return result
 
 
 class ZodModel(BaseModel):

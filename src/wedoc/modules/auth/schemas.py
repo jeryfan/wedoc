@@ -9,6 +9,7 @@ from pydantic import field_validator
 from ...core.validation import (
     ZodEmailStr,
     ZodModel,
+    js_length,
     zod_email,
     zod_int,
     zod_password_checks,
@@ -59,9 +60,9 @@ class SignupBody(ZodModel):
     def _default_space_name(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(v) > SPACE_NAME_MAX_LENGTH:
+        if js_length(v) > SPACE_NAME_MAX_LENGTH:
             raise ValueError("Too big: expected string to have <=100 characters")
         return v
 

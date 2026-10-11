@@ -2,7 +2,7 @@
 
 from pydantic import field_validator
 
-from ...core.validation import ZodEnumStr, ZodModel
+from ...core.validation import ZodEnumStr, ZodModel, js_length
 
 # z.nativeEnum(ShortLinkType) — only the enum values are accepted (unlike the
 # pin z.enum case), and the error lists just those values.
@@ -17,8 +17,8 @@ class CreateShortLinkRo(ZodModel):
     @field_validator("resourceId")
     @classmethod
     def _resource_id(cls, value: str) -> str:
-        if len(value) < 1:
+        if js_length(value) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(value) > 50:
+        if js_length(value) > 50:
             raise ValueError("Too big: expected string to have <=50 characters")
         return value

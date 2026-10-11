@@ -6,7 +6,7 @@ from typing import Any
 from pydantic import Field, StrictBool, field_validator, model_validator
 
 from ...core.errors import ApiError, HttpErrorCode
-from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel
+from ...core.validation import ZodEmailStr, ZodEnumStr, ZodModel, js_length
 
 _INTERNAL_SCHEMA_RE = _re.compile(r"^[a-z_]\w*$", _re.IGNORECASE)
 
@@ -39,9 +39,9 @@ class CreateSpaceBody(ZodModel):
     def _name(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
-        if len(v) > SPACE_NAME_MAX_LENGTH:
+        if js_length(v) > SPACE_NAME_MAX_LENGTH:
             raise ValueError("Too big: expected string to have <=100 characters")
         return v
 
@@ -73,7 +73,7 @@ class SpaceSearchQuery(ZodModel):
     @field_validator("search")
     @classmethod
     def _search(cls, v: str) -> str:
-        if len(v) < 1:
+        if js_length(v) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
         return v
 
@@ -209,7 +209,7 @@ class DataDbPreflightRo(ZodModel):
     @field_validator("url")
     @classmethod
     def _url(cls, value: str) -> str:
-        if len(value) < 1:
+        if js_length(value) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
         return value
 

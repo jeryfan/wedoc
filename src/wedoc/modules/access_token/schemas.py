@@ -6,7 +6,7 @@ from typing import Annotated
 from pydantic import StrictBool, field_validator
 
 from ...core.security.permissions import ALL_ACTIONS
-from ...core.validation import ZodEnumStr, ZodModel, ZodNullable
+from ...core.validation import ZodEnumStr, ZodModel, ZodNullable, js_length
 
 _SCOPE_OPTIONS = list(ALL_ACTIONS)
 ScopeStr = ZodEnumStr(_SCOPE_OPTIONS)
@@ -49,7 +49,7 @@ class CreateAccessTokenRo(_ScopesMixin):
     @field_validator("name")
     @classmethod
     def _name_min(cls, value: str) -> str:
-        if len(value) < 1:
+        if js_length(value) < 1:
             raise ValueError("Too small: expected string to have >=1 characters")
         return value
 
