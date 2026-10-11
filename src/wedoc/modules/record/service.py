@@ -2057,9 +2057,9 @@ class RecordService:
             view = await get_view_row(table_id, view_id)
             if view is None:
                 raise ApiError(
-                    f"View {view_id} not found",
+                    f"View not found: {view_id}",
                     HttpErrorCode.NOT_FOUND,
-                    {"localization": {"i18nKey": "httpErrors.view.notFound"}},
+                    {"domainCode": "view.not_found", "domainTags": ["not-found"]},
                 )
             # column visibility applies to the projection even under
             # ignoreViewQuery, which only relaxes the view filter/sort.

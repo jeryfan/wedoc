@@ -267,11 +267,9 @@ class AggregationService:
         if view_id and not ignore_view_query:
             view = await get_view_row(table_id, view_id)
             if view is None:
-                raise ApiError(
-                    f"View {view_id} not found",
-                    HttpErrorCode.NOT_FOUND,
-                    {"localization": {"i18nKey": "httpErrors.view.notFound"}},
-                )
+                # The reference resolves a view through its unguarded query
+                # path here, so a missing view surfaces as an unhandled 500.
+                raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
             view_filter = json.loads(view["filter"]) if view.get("filter") else None
         if view_filter and filter_param:
             return {"conjunction": "and", "filterSet": [view_filter, filter_param]}
@@ -442,11 +440,9 @@ class AggregationService:
         elif view_id and not ignore_view_query:
             view = await get_view_row(table_id, view_id)
             if view is None:
-                raise ApiError(
-                    f"View {view_id} not found",
-                    HttpErrorCode.NOT_FOUND,
-                    {"localization": {"i18nKey": "httpErrors.view.notFound"}},
-                )
+                # The reference resolves a view through its unguarded query
+                # path here, so a missing view surfaces as an unhandled 500.
+                raise ApiError("Internal Server Error", HttpErrorCode.INTERNAL_SERVER_ERROR)
             column_meta = json.loads(view["column_meta"]) if view.get("column_meta") else {}
             for field in fields:
                 meta = column_meta.get(field["id"]) or {}
