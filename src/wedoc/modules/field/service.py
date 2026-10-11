@@ -14,6 +14,7 @@ from typing import Any
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.ids import IdPrefix, is_valid_prefixed_id, new_id
+from ...core.timezone import server_timezone
 from ...db import provider as ddl
 from ...formula import (
     FormulaError,
@@ -402,10 +403,10 @@ def _lookup_field_id_invalid(lookup_field_id: str) -> ApiError:
 
 _DEFAULT_FORMATTING = {"number": {"type": "decimal", "precision": 2}}
 
-# The reference defaults a formula field's timeZone to the server's resolved
-# timezone (Intl...). That is environment-specific; wedoc uses a deterministic
-# default, overridable via options.timeZone.
-_FORMULA_TIMEZONE = "UTC"
+# The reference defaults date/formula timeZones to the server's resolved zone
+# (Node Intl), which follows TZ and then /etc/localtime.
+def _formula_timezone() -> str:
+    return server_timezone()
 
 
 def _formula_parse_error(expression: str | None, exc: Exception) -> ApiError:
@@ -450,7 +451,7 @@ def _default_formula_formatting(cell_value_type: str) -> dict[str, Any] | None:
     if cell_value_type == "number":
         return {"type": "decimal", "precision": 2}
     if cell_value_type == "dateTime":
-        return {"date": "YYYY-MM-DD", "time": "None", "timeZone": _FORMULA_TIMEZONE}
+        return {"date": "YYYY-MM-DD", "time": "None", "timeZone": _formula_timezone()}
     return None
 
 
@@ -662,7 +663,7 @@ def _normalize_options(field_type: str, options: dict[str, Any] | None) -> dict[
         # DateFieldCore.defaultOptions(): applied when the create/convert request
         # omits options. timeZone mirrors the formula-field convention (UTC).
         options = {
-            "formatting": {"date": "YYYY-MM-DD", "time": "None", "timeZone": _FORMULA_TIMEZONE}
+            "formatting": {"date": "YYYY-MM-DD", "time": "None", "timeZone": _formula_timezone()}
         }
     if field_type in ("createdTime", "lastModifiedTime"):
         # prepare{Created,LastModified}TimeField: inject the fixed formula
@@ -1391,7 +1392,7 @@ class FieldService:
             options["formatting"] = formatting
         else:
             options.pop("formatting", None)
-        options["timeZone"] = options_ro.get("timeZone", _FORMULA_TIMEZONE)
+        options["timeZone"] = options_ro.get("timeZone", _formula_timezone())
         db_field_type = _derive_db_field_type("formula", cell_value_type, is_multiple)
 
         name = _dedup_name(body.name or "Calculation", {f["name"] for f in siblings})
@@ -1851,7 +1852,7 @@ class FieldService:
         options["formatting"] = fmt
         if fmt is None:
             options.pop("formatting", None)
-        options["timeZone"] = options_ro.get("timeZone", _FORMULA_TIMEZONE)
+        options["timeZone"] = options_ro.get("timeZone", _formula_timezone())
         db_type = _derive_db_field_type("formula", cvt, is_multiple)
         ids = [r for r, _ in await repository.list_cell_values(base_id, table_id, old_db)]
         updates = {
