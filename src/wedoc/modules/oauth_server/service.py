@@ -311,7 +311,9 @@ class OAuthServerService:
         client_id = params.get("client_id")
         app = await _get_app(client_id) if client_id else None
         if app is None:
-            raise ApiError("Unknown client", HttpErrorCode.VALIDATION_ERROR)
+            # The reference's client lookup throws inside passport's client
+            # strategy, which surfaces as 401 unauthorized rather than a 400.
+            raise ApiError("Unauthorized", HttpErrorCode.UNAUTHORIZED)
         return app
 
     # -- authorization-code consent flow ---------------------------------------
@@ -323,7 +325,9 @@ class OAuthServerService:
         client_id = params.get("client_id")
         app = await _get_app(client_id) if client_id else None
         if app is None:
-            raise OAuthTokenError("Unknown client", 400)
+            # Same 401 as the reference; its message is a Prisma internal error
+            # (it embeds a local file path), so a stable message is used here.
+            raise ApiError("Unauthorized", HttpErrorCode.UNAUTHORIZED)
         query_scopes = _split_scopes(params.get("scope"))
         invalid = [s for s in query_scopes if s not in app["scopes"]]
         if invalid:
