@@ -33,13 +33,21 @@ router = APIRouter(
 )
 
 
-def _json_param(raw: str | None) -> Any:
+def _json_param(raw: str | None, key: str, noun: str) -> Any:
+    """zod ``.preprocess(JSON.parse, schema)``: an unparseable value stays a string
+
+    and the schema then rejects it, which is why a bad ``filter``/``orderBy``/
+    ``groupBy`` reports zod's ``expected <noun>, received string``.
+    """
     if not raw:
         return None
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise ApiError(
+            f'Validation error: Invalid input: expected {noun}, received string at "{key}"',
+            HttpErrorCode.VALIDATION_ERROR,
+        ) from exc
 
 
 def _record_ids_from_query(params: Any) -> list[str]:
@@ -175,11 +183,13 @@ async def list_records(tableId: str, request: Request) -> dict[str, Any]:
         field_key_type=field_key_type,
         projection=query_list(params, "projection") or None,
         view_id=params.get("viewId"),
-        filter_param=_json_param(params.get("filter")),
-        sort_param=_json_param(params.get("sort")),
-        order_by=_json_param(params.get("orderBy")),
-        group_by=_json_param(params.get("groupBy")),
-        collapsed_group_ids=_json_param(params.get("collapsedGroupIds")),
+        filter_param=_json_param(params.get("filter"), "filter", "object"),
+        sort_param=_json_param(params.get("sort"), "sort", "array"),
+        order_by=_json_param(params.get("orderBy"), "orderBy", "array"),
+        group_by=_json_param(params.get("groupBy"), "groupBy", "array"),
+        collapsed_group_ids=_json_param(
+            params.get("collapsedGroupIds"), "collapsedGroupIds", "array"
+        ),
         tql=params.get("filterByTql"),
         search=query_array(params, "search", expected="tuple"),
         ignore_view_query=ignore_view_query,
@@ -319,10 +329,12 @@ async def get_record_status(tableId: str, recordId: str, request: Request) -> di
         tableId,
         recordId,
         view_id=params.get("viewId"),
-        filter_param=_json_param(params.get("filter")),
-        order_by=_json_param(params.get("orderBy")),
-        group_by=_json_param(params.get("groupBy")),
-        collapsed_group_ids=_json_param(params.get("collapsedGroupIds")),
+        filter_param=_json_param(params.get("filter"), "filter", "object"),
+        order_by=_json_param(params.get("orderBy"), "orderBy", "array"),
+        group_by=_json_param(params.get("groupBy"), "groupBy", "array"),
+        collapsed_group_ids=_json_param(
+            params.get("collapsedGroupIds"), "collapsedGroupIds", "array"
+        ),
         search=query_array(params, "search", expected="tuple"),
         ignore_view_query=(params.get("ignoreViewQuery") or "").lower() == "true",
         take=int(take) if take and take.isdigit() else 100,
