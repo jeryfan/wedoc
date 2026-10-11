@@ -409,15 +409,24 @@ class TableService:
         field_key_type: str,
     ) -> list[dict[str, Any]]:
         user_id = cls.get("user.id")
-        columns = ["__id", "__created_by", "__version"] + [f["dbFieldName"] for f in fields]
+        # __last_modified_* are stamped on insert too (the reference's rows
+        # already carry them for the default blank rows).
+        columns = [
+            "__id",
+            "__created_by",
+            "__last_modified_by",
+            "__version",
+        ] + [f["dbFieldName"] for f in fields]
+        columns.append("__last_modified_time")
         value_rows: list[list[Any]] = []
+        modified_time = datetime.now(UTC).replace(tzinfo=None)
         pending: list[dict[str, Any]] = []
         history_rows: list[dict[str, Any]] = []
         for record_ro in record_ros:
             raw = record_ro if isinstance(record_ro, dict) else record_ro.model_dump()
             record_fields = raw.get("fields") or {}
             record_id = new_id(IdPrefix.RECORD)
-            values: list[Any] = [record_id, user_id, 1]
+            values: list[Any] = [record_id, user_id, user_id, 1]
             vo_fields: dict[str, Any] = {}
             name_value: Any = None
             for field in fields:
@@ -451,6 +460,8 @@ class TableService:
                 )
                 if entry:
                     history_rows.append(entry)
+            # stamped like the DDL default for __created_time
+            values.append(modified_time)
             value_rows.append(values)
             pending.append({"id": record_id, "fields": vo_fields, "name": name_value})
         await repository.insert_data_rows(base_id, table_id, columns, value_rows)
