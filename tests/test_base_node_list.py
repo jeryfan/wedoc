@@ -1,4 +1,4 @@
-"""Base-node list/tree serialize resourceMeta users with a full avatar URL and
+"""Base-node list/tree serialize resourceMeta users with the stored avatar path and
 an integer order (matching the reference's JS number serialization)."""
 
 from conftest import signup as _signup
@@ -22,6 +22,6 @@ async def test_node_list_avatar_full_url_and_int_order(client):
     assert node["order"] == 1
     assert isinstance(node["order"], int)
     user = node["resourceMeta"]["createdByUser"]
-    # avatar is the full public storage URL, not the raw relative path
-    assert user["avatar"].startswith("http")
-    assert "/api/attachments/read/public/avatar/" in user["avatar"]
+    # the node API echoes the stored avatar path, not the public URL
+    assert user["avatar"].startswith("avatar/")
+    assert not user["avatar"].startswith("http")

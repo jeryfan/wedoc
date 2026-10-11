@@ -16,7 +16,6 @@ from typing import Any
 from ...core import cls
 from ...core.errors import ApiError, HttpErrorCode
 from ...core.ids import IdPrefix, new_id
-from ...core.storage import get_public_full_storage_url
 from ..space import repository as space_repository
 from ..space.service import get_uniq_name
 from . import repository
@@ -92,7 +91,8 @@ class BaseNodeService:
                 "id": u["id"],
                 "name": u["name"],
                 "email": u["email"],
-                "avatar": get_public_full_storage_url(u["avatar"]) if u["avatar"] else None,
+                # The node API echoes the stored avatar path, not a public URL.
+                "avatar": u["avatar"],
             }
             for u in users
         }
