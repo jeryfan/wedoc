@@ -36,6 +36,7 @@ from ..user import repository as user_repository
 from ..user.service import UserService
 from . import repository as waitlist_repository
 from .schemas import SignupBody
+from .turnstile import validate_turnstile
 
 logger = structlog.get_logger(__name__)
 
@@ -136,7 +137,10 @@ class AuthService:
             return user
         return None
 
-    async def signin(self, email: Any, password: Any) -> dict[str, Any]:
+    async def signin(
+        self, email: Any, password: Any, *,
+        turnstile_token: Any = None, remote_ip: str | None = None,
+    ) -> dict[str, Any]:
         """LocalStrategy.validate: any failure becomes invalid_credentials (or
         the lockout error when SIGNIN_* lockout envs are set)."""
         invalid = ApiError(
@@ -148,6 +152,7 @@ class AuthService:
         lockout_minutes = self._settings.signin_account_lockout_minutes
         has_lockout = bool(max_attempts and lockout_minutes)
         try:
+            await validate_turnstile(self._settings, turnstile_token, remote_ip)
             user = await self.validate_user_by_email(email, password)
             if not user:
                 raise invalid
@@ -231,7 +236,10 @@ class AuthService:
                 {"localization": {"i18nKey": "httpErrors.auth.systemUser"}},
             )
 
-    async def signup(self, body: SignupBody, lang: str | None = None) -> dict[str, Any]:
+    async def signup(
+        self, body: SignupBody, lang: str | None = None, *, remote_ip: str | None = None
+    ) -> dict[str, Any]:
+        await validate_turnstile(self._settings, body.turnstileToken, remote_ip)
         await self._verify_signup(body)
         user = await self._users.get_user_by_email(body.email)
         self._is_registered_validate(user)
@@ -269,6 +277,12 @@ class AuthService:
         )
 
     # -- signup verification code ----------------------------------------------
+
+    async def send_signup_verification_code_with_turnstile(
+        self, email: str, token: str | None = None, remote_ip: str | None = None
+    ) -> dict[str, Any]:
+        await validate_turnstile(self._settings, token, remote_ip)
+        return await self.send_signup_verification_code(email)
 
     async def send_signup_verification_code(self, email: str) -> dict[str, Any]:
         setting = await self._users.get_setting()

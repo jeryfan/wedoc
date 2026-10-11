@@ -119,7 +119,9 @@ class SettingService:
         result["socialAuthProviders"] = settings.social_providers
         result["emailCodeSigninEnabled"] = False
         result["buildVersion"] = _resolve_build_version()
-        result["turnstileSiteKey"] = getattr(settings, "backend_turnstile_site_key", None)
+        result["turnstileSiteKey"] = (
+            settings.turnstile_site_key if settings.is_turnstile_enabled else None
+        )
         result["changeEmailSendCodeMailRate"] = settings.backend_change_email_send_code_mail_rate
         result["resetPasswordSendMailRate"] = settings.backend_reset_password_send_mail_rate
         result["signupVerificationSendCodeMailRate"] = (

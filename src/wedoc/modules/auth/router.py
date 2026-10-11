@@ -60,7 +60,10 @@ async def signin(request: Request, response: Response) -> dict[str, Any]:
     password = body.get("password") if isinstance(body, dict) else None
     if not email or not password:
         raise ApiError("Unauthorized", HttpErrorCode.UNAUTHORIZED)
-    user = await AuthService().signin(email, password)
+    user = await AuthService().signin(
+        email, password, turnstile_token=body.get("turnstileToken"),
+        remote_ip=request.client.host if request.client else None,
+    )
     await session_login(request, response, user["id"])
     return user
 
@@ -69,7 +72,10 @@ async def signin(request: Request, response: Response) -> dict[str, Any]:
 @public()
 async def signup(request: Request, response: Response) -> dict[str, Any]:
     body = SignupBody.zod_validate(await read_json_body(request))
-    user = await AuthService().signup(body, lang=resolve_lang(request))
+    user = await AuthService().signup(
+        body, lang=resolve_lang(request),
+        remote_ip=request.client.host if request.client else None,
+    )
     await session_login(request, response, user["id"])
     return pick_user_me(user)
 
@@ -86,7 +92,9 @@ async def signout(request: Request) -> Response:
 @public()
 async def send_signup_verification_code(request: Request) -> dict[str, Any]:
     body = SendSignupVerificationCodeBody.zod_validate(await read_json_body(request))
-    return await AuthService().send_signup_verification_code(body.email)
+    return await AuthService().send_signup_verification_code_with_turnstile(
+        body.email, body.turnstileToken, request.client.host if request.client else None
+    )
 
 
 @router.post("/join-waitlist", status_code=201)
