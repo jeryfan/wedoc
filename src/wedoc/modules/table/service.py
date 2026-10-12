@@ -735,7 +735,13 @@ class TableService:
     async def delete_table(self, base_id: str, table_id: str) -> None:
         table = await repository.get_table_meta_row(table_id, base_id)
         if table is None:
-            raise _table_not_found(table_id, base_id)
+            # The reference's delete route words this "in base" (table-open-api
+            # .controller.ts deleteTable), unlike the shared "in project".
+            raise ApiError(
+                f"Table {table_id} not found in base {base_id}",
+                HttpErrorCode.NOT_FOUND,
+                {"localization": {"i18nKey": "httpErrors.notFound"}},
+            )
         deleted_time = datetime.now(UTC).replace(tzinfo=None)
         await repository.soft_delete_table_row(
             table_id, deleted_time, table["version"] + 1
